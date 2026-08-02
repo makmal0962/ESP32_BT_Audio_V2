@@ -51,6 +51,42 @@ menu "A2DP DSP BLE Configuration"
             range 0 39
             help
                 GPIO pin for beat detection LED.
+        
+        config DISPLAY_I2C_SCL_GPIO
+            int "OLED SCL GPIO"
+            default 22
+            range 0 39
+            help
+                GPIO pin for OLED Display
+
+        config DISPLAY_I2C_SDA_GPIO
+            int "OLED SDA GPIO"
+            default 21
+            range 0 39
+            help
+                GPIO pin for OLED Display
+    endmenu
+
+    menu "Physical Transport Buttons"
+        config BTN_PREV_GPIO
+            int "Previous Track Button GPIO"
+            default 16
+            range 0 39
+
+        config BTN_PLAY_GPIO
+            int "Play/Pause Button GPIO"
+            default 18
+            range 0 39
+
+        config BTN_NEXT_GPIO
+            int "Next Track Button GPIO"
+            default 17
+            range 0 39
+
+        config BTN_MODE_GPIO
+            int "Mode/Screen Button GPIO"
+            default 19
+            range 0 39
     endmenu
 
     menu "DSP Configuration"

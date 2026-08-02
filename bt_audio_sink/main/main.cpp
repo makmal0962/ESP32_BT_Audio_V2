@@ -31,6 +31,7 @@
  #include "storage/nvs_settings.h"
  #include "audio/i2s_output.h"
  #include "audio/audio_pipeline.h"
+ #include "display/oled_display.h"
  #include "audio/sound_player.h"
  #include "audio/overlay_mixer.h"
  #include "ble/ble_unified.h"
@@ -319,6 +320,76 @@
      ESP_LOGI(TAG, "3D Sound removed in low-RAM build");
  }
  #endif
+
+ // -----------------------------------------------------------
+// Transport controls (shared by physical buttons and encoder)
+// -----------------------------------------------------------
+static volatile bool g_isPlaying = true;   // synced from onAudioState
+
+static void doVolumeSet(uint8_t volume) {
+    g_a2dp.set_volume(volume);
+    g_dsp.setVolume(volume);
+    #ifdef CONFIG_LED_MATRIX_ENABLE
+    LedController::getInstance().setVolume(volume);
+    #endif
+}
+
+static void doPlayPause() {
+    if (g_isPlaying) g_a2dp.pause();
+    else g_a2dp.play();
+    g_isPlaying = !g_isPlaying;
+    ESP_LOGI(TAG, "Transport: %s", g_isPlaying ? "pause" : "play");
+}
+
+static void doNextTrack() {
+    g_a2dp.next();
+    ESP_LOGI(TAG, "Transport: next track");
+}
+
+static void doPrevTrack() {
+    g_a2dp.previous();
+    ESP_LOGI(TAG, "Transport: previous track");
+}
+
+static void doPairingMode() {
+    // If connected, disconnect first
+    esp_a2d_connection_state_t state = g_a2dp.get_connection_state();
+    
+    // Set pairing mode flag - prevents disconnect callback from interfering
+    g_pairingModeActive = true;
+    
+    if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+        ESP_LOGI(TAG, "Disconnecting current device to enter pairing mode...");
+        g_a2dp.disconnect();
+        vTaskDelay(pdMS_TO_TICKS(500));  // Wait for disconnect
+    }
+    else {
+        ESP_LOGI(TAG, "Nothing to disconnect. skipping...");
+        return;
+    }
+    
+    // Reset I2S to default sample rate for sound playback
+    g_sampleRate = APP_I2S_DEFAULT_SAMPLE_RATE;
+    g_i2s.updateClock(APP_I2S_DEFAULT_SAMPLE_RATE);
+    g_dsp.setSampleRate(APP_I2S_DEFAULT_SAMPLE_RATE);
+    
+    // Enable discoverable mode for new device pairing
+    // ESP_BT_GENERAL_DISCOVERABLE = visible to all devices for pairing
+    ESP_LOGI(TAG, "Entering pairing mode - device is now discoverable");
+    g_a2dp.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
+    
+    // Play pairing sound (exclusive mode - no A2DP during pairing anyway)
+    // Use actual I2S sample rate to ensure proper resampling
+    g_sound.play(SOUND_PAIRING, g_i2s.getSampleRate(), SOUND_MODE_EXCLUSIVE);
+    
+    // Start pairing mode LED animation (slow blue pulsing)
+    #ifdef CONFIG_LED_MATRIX_ENABLE
+    LedController::getInstance().setPairingMode(true);
+    #endif
+    
+    // NOTE: g_pairingModeActive stays true until a device connects
+    // This prevents the disconnect callback from resetting discoverability or LED animation
+}
  
  // -----------------------------------------------------------
  // BLE callbacks
@@ -1728,10 +1799,22 @@
  // Button handling task
  // -----------------------------------------------------------
  static void buttonsTask(void* arg) {
-     bool lastBtn1 = true, btn1Pressed = false;
-     uint32_t debounce1 = 0, pressStart1 = 0;
-     bool lastBtn2 = true, btn2State = true;
-     uint32_t debounce2 = 0;
+    //  bool lastBtn1 = true, btn1Pressed = false;
+    //  uint32_t debounce1 = 0, pressStart1 = 0;
+    //  bool lastBtn2 = true, btn2State = true;
+    //  uint32_t debounce2 = 0;
+
+    bool lastPrev = true, lastPlay = true, lastNext = true, lastMode = true;
+    bool statePrev = true, statePlay = true, stateNext = true, stateMode = true;
+    uint32_t debouncePrev = 0, debouncePlay = 0, debounceNext = 0, debounceMode = 0;
+    uint32_t pressStartPrev = 0, pressStartPlay = 0, pressStartNext = 0, presStartMode = 0;
+    bool heldPrev = false, heldPlay = false, heldNext = false, heldMode = false;
+    uint32_t lastRepeatPrev = 0, lastRepeatNext = 0;
+
+    const uint32_t HOLD_THRESHOLD_MS = 500;
+    const uint32_t REPEAT_INTERVAL_MS = 150;
+    const uint8_t  VOLUME_STEP = 4;
+
      
      // LED effect button (can be separate or shared with button 2)
      #ifdef CONFIG_LED_MATRIX_ENABLE
@@ -1752,6 +1835,13 @@
          const gpio_num_t ledBtnGpio = (gpio_num_t)19;  // Default
      #endif
      #endif
+
+     auto adjustVolume = [](int delta) {
+        int v = (int)g_dsp.getVolume() + delta;
+        if (v < 0) v = 0; 
+        if (v > 127) v = 127;
+        doVolumeSet((uint8_t)v);
+    };
  
      while (true) {
          uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
@@ -1782,59 +1872,64 @@
                  }
              }
          }
-         
-         bool r1 = gpio_get_level((gpio_num_t)APP_BUTTON1_GPIO);
-         if (r1 != lastBtn1) debounce1 = now;
-         if ((now - debounce1) > 25) {
-             if (!btn1Pressed && r1 == 0) {
-                 btn1Pressed = true;
-                 pressStart1 = now;
-             } else if (btn1Pressed && r1 == 1) {
-                 btn1Pressed = false;
-                 if ((now - pressStart1) < 1000) {
-                     g_dsp.setBassBoost(!g_dsp.isBassBoostEnabled());
-                 } else {
-                     g_dsp.setChannelFlip(!g_dsp.isChannelFlipEnabled());
-                 }
-                 g_settings.saveControl(g_dsp.isBassBoostEnabled(), 
-                                        g_dsp.isChannelFlipEnabled(), 
-                                        g_dsp.isBypassEnabled());
-                 g_ble.updateControl(getControlByte());
-             }
-         }
-         lastBtn1 = r1;
- 
-         bool r2 = gpio_get_level((gpio_num_t)APP_BUTTON2_GPIO);
-         if (r2 != lastBtn2) debounce2 = now;
-         if ((now - debounce2) > 25 && r2 != btn2State) {
-             btn2State = r2;
-             if (r2 == 1) {
-                 g_dsp.setBypass(!g_dsp.isBypassEnabled());
-                 g_settings.saveControl(g_dsp.isBassBoostEnabled(),
-                                        g_dsp.isChannelFlipEnabled(),
-                                        g_dsp.isBypassEnabled());
-                 g_ble.updateControl(getControlByte());
-             }
-         }
-         lastBtn2 = r2;
- 
-         // LED effect cycle button
-         #ifdef CONFIG_LED_MATRIX_ENABLE
-         bool rLed = gpio_get_level(ledBtnGpio);
-         if (rLed != lastBtnLed) debounceLed = now;
-         if ((now - debounceLed) > 25 && rLed != btnLedState) {
-             btnLedState = rLed;
-             if (rLed == 1) {  // Button released
-                 LedController::getInstance().nextEffect();
-                 uint8_t newEffect = LedController::getInstance().getCurrentEffectId();
-                 g_settings.saveLedEffect(newEffect);
-                 g_ble.updateLedEffect(newEffect);
-                 ESP_LOGI(TAG, "LED effect: %s", LedController::getInstance().getCurrentEffectName());
-             }
-         }
-         lastBtnLed = rLed;
-         #endif
- 
+
+        // --- Prev (tap = prev track, hold = volume down) ---
+        bool rPrev = gpio_get_level((gpio_num_t)APP_BTN_PREV_GPIO);
+        if (rPrev != lastPrev) debouncePrev = now;
+        if ((now - debouncePrev) > 25 && rPrev != statePrev) {
+            statePrev = rPrev;
+            if (rPrev == 0) { pressStartPrev = now; heldPrev = false; }
+            else if (!heldPrev) doPrevTrack();
+        }
+        if (statePrev == 0 && (now - pressStartPrev) >= HOLD_THRESHOLD_MS) {
+            if (!heldPrev || (now - lastRepeatPrev) >= REPEAT_INTERVAL_MS) {
+                adjustVolume(-VOLUME_STEP);
+                heldPrev = true;
+                lastRepeatPrev = now;
+            }
+        }
+        lastPrev = rPrev;
+
+        // --- Next (tap = next track, hold = volume up) ---
+        bool rNext = gpio_get_level((gpio_num_t)APP_BTN_NEXT_GPIO);
+        if (rNext != lastNext) debounceNext = now;
+        if ((now - debounceNext) > 25 && rNext != stateNext) {
+            stateNext = rNext;
+            if (rNext == 0) { pressStartNext = now; heldNext = false; }
+            else if (!heldNext) doNextTrack();
+        }
+        if (stateNext == 0 && (now - pressStartNext) >= HOLD_THRESHOLD_MS) {
+            if (!heldNext || (now - lastRepeatNext) >= REPEAT_INTERVAL_MS) {
+                adjustVolume(VOLUME_STEP);
+                heldNext = true;
+                lastRepeatNext = now;
+            }
+        }
+        lastNext = rNext;
+
+        // --- Play ---
+        bool rPlay = gpio_get_level((gpio_num_t)APP_BTN_PLAY_GPIO);
+        if (rPlay != lastPlay) debouncePlay = now; 
+        if ((now - debouncePlay) > 25 && rPlay != statePlay) {
+            statePlay = rPlay;
+            if (rPlay == 0) { pressStartPlay = now; heldPlay = false; }
+            else if (!heldNext) doPlayPause();
+        }
+        if (statePlay == 0 && (now - pressStartPlay) >= 1500 && !heldPlay) { // exclusive 3 seconds for pairing mode
+            heldPlay = true;
+            doPairingMode();
+        }
+        lastPlay = rPlay;
+
+        // --- Mode (cycle screens, including Settings) ---
+        bool rMode = gpio_get_level((gpio_num_t)APP_BTN_MODE_GPIO);
+        if (rMode != lastMode) debounceMode = now;
+        if ((now - debounceMode) > 25 && rMode != stateMode) {
+            stateMode = rMode;
+            if (rMode == 0) OledDisplay::instance().cycleScreen();
+        }
+        lastMode = rMode;
+
          vTaskDelay(pdMS_TO_TICKS(10));
      }
  }
@@ -2119,7 +2214,8 @@
      gpio_config_t io = {};
      io.intr_type = GPIO_INTR_DISABLE;
      io.mode = GPIO_MODE_INPUT;
-     io.pin_bit_mask = (1ULL << APP_BUTTON1_GPIO) | (1ULL << APP_BUTTON2_GPIO);
+     io.pin_bit_mask = (1ULL << APP_BTN_PREV_GPIO) | (1ULL << APP_BTN_PLAY_GPIO)
+                 | (1ULL << APP_BTN_NEXT_GPIO) | (1ULL << APP_BTN_MODE_GPIO);
      io.pull_up_en = GPIO_PULLUP_ENABLE;
      gpio_config(&io);
  
@@ -2129,6 +2225,11 @@
      gpio_config(&led);
      gpio_set_level((gpio_num_t)APP_BEAT_LED_GPIO, 0);
  
+     // Initialize OLED Display
+     AudioTap::instance().init();
+     OledDisplay::instance().init();
+     logHeap("after_oled");
+
      // ========================================================================
      // STARTUP SEQUENCE: Play startup sound + LED animation BEFORE BLE/A2DP
      // Both must complete before initializing anything else
@@ -2267,7 +2368,7 @@
      g_a2dp.set_output_active(false);
      g_a2dp.set_stream_reader(onStreamData, false);
      g_a2dp.set_codec_config_callback(onCodecConfig);
-     g_a2dp.set_auto_reconnect(false);
+     g_a2dp.set_auto_reconnect(true, 3);
      g_a2dp.set_task_core(1);
      g_a2dp.set_on_connection_state_changed(onConnectionState);
      g_a2dp.set_on_audio_state_changed(onAudioState);
@@ -2283,6 +2384,8 @@
          EncoderController::getInstance().setCurrentVolume((uint8_t)volume);
          ESP_LOGI(TAG, "Phone volume changed to %d - encoder synced", volume);
          #endif
+         
+         OledDisplay::instance().setVolume((uint8_t)volume);
          
          // Skip max volume sound during connection grace period (ignore initial volume report)
          // Also skip if g_lastConnectTime is 0 (no connection yet - system still initializing)

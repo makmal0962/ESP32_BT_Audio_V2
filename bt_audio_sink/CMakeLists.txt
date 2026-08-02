@@ -10,3 +10,5 @@ endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(bt_audio_sink)
+
+spiffs_create_partition_image(spiffs data FLASH_IN_PROJECT)

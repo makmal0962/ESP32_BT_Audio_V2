@@ -21,6 +21,7 @@
 #include "../dsp/dsp_processor.h"
 #include "i2s_output.h"
 #include "overlay_mixer.h"
+#include "../display/audio_tap.h"
 
 typedef bool (*ShouldSkipWriteCallback)();
 
@@ -418,6 +419,7 @@ private:
         m_ringBuf[idx + 0] = left;
         m_ringBuf[idx + 1] = right;
         m_writeIdx = nextWrite;
+        AudioTap::instance().onFrame(left, right);
         return true;
     }
 

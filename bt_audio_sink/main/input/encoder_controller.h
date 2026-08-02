@@ -33,7 +33,7 @@
     #define ENCODER_QUAD_ADDR  0x36  // SEESAW_QUAD_DEFAULT_ADDR
 #endif
 
-#define ENCODER_I2C_PORT      I2C_NUM_1
+#define ENCODER_I2C_PORT      I2C_NUM_0
 #define ENCODER_I2C_FREQ_HZ   400000  // 400kHz standard
 #define ENCODER_POLL_MS       25  // 25ms polling (reduced from 10ms to avoid audio interference)
 

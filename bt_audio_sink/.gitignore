@@ -24,3 +24,5 @@ dependencies.lock
 # OS files
 .DS_Store
 Thumbs.db
+
+managed_components/

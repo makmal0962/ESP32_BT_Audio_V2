@@ -1,6 +1,22 @@
 # Edit following two lines to set component requirements (see docs)
 set(COMPONENT_REQUIRES)
-set(COMPONENT_PRIV_REQUIRES )
+set(COMPONENT_PRIV_REQUIRES 
+    driver 
+    esp_driver_i2c
+    esp_driver_spi
+    heap 
+    esp_rom 
+    nvs_flash 
+    esp_timer 
+    log 
+    app_update 
+    esp_partition 
+    bt 
+    spiffs 
+    u8g2 
+    u8g2_hal
+    mbedtls
+)
 
 set(COMPONENT_SRCS 
     "main.cpp" 
@@ -19,6 +35,7 @@ set(COMPONENT_ADD_INCLUDEDIRS
     "led" 
     "ota" 
     "storage"
+    "display"
 )
 
 register_component()

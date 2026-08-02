@@ -1,0 +1,6 @@
+[submodule "bt_audio_sink/components/u8g2"]
+	path = bt_audio_sink/components/u8g2
+	url = https://github.com/olikraus/u8g2.git
+[submodule "bt_audio_sink/components/u8g2_hal"]
+	path = bt_audio_sink/components/u8g2_hal
+	url = https://github.com/mkfrey/u8g2-hal-esp-idf.git
