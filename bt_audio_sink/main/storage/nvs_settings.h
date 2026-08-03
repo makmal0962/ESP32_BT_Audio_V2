@@ -213,6 +213,26 @@ public:
         return true;
     }
 
+    // Load input mode from NVS (0=BT, 1=Line)
+    uint8_t loadInputMode() {
+        nvs_handle_t h;
+        if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return 0;
+        uint8_t mode = 0;
+        nvs_get_u8(h, "input_mode", &mode);
+        nvs_close(h);
+        return mode;
+    }
+
+    // Save input mode to NVS
+    bool saveInputMode(uint8_t mode) {
+        nvs_handle_t h;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+        nvs_set_u8(h, "input_mode", mode);
+        nvs_commit(h);
+        nvs_close(h);
+        return true;
+    }
+
 private:
     static constexpr const char* TAG = "NVS";
     Settings m_settings;

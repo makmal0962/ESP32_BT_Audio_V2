@@ -112,7 +112,7 @@
  
  // Max volume sound rate limiting - prevent crash from spamming
  static volatile int64_t  g_lastMaxVolumeSound = 0;     // Timestamp of last max volume sound
- static const int64_t     MAX_VOLUME_SOUND_COOLDOWN_US = 2000000;  // 2 seconds cooldown between plays
+ static const int64_t     MAX_VOLUME_SOUND_COOLDOWN_US = 500000;  // 500 ms cooldown between plays
  
  // Max-volume overlay now returns seamlessly through OverlayMixer's duck ramp.
  // No same-rate I2S recovery/reset is used here; the previous post-effect
@@ -129,6 +129,12 @@
  static float smooth30_dB = -60.0f;
  static float smooth60_dB = -60.0f;
  static float smooth100_dB = -60.0f;
+
+ // Line input switching state
+ enum InputMode { MODE_BT, MODE_LINE };
+ static volatile InputMode g_inputMode = MODE_BT;
+
+ static std::string deviceName;
  
  // -----------------------------------------------------------
  // Control helpers
@@ -337,8 +343,8 @@ static void doVolumeSet(uint8_t volume) {
 static void doPlayPause() {
     if (g_isPlaying) g_a2dp.pause();
     else g_a2dp.play();
-    g_isPlaying = !g_isPlaying;
     ESP_LOGI(TAG, "Transport: %s", g_isPlaying ? "pause" : "play");
+    g_isPlaying = !g_isPlaying;
 }
 
 static void doNextTrack() {
@@ -1566,7 +1572,7 @@ static void doPairingMode() {
      
      // Get codec type (the library's codec_config.c already logs vendor ID details)
      esp_a2d_mct_t codecType = g_a2dp.get_audio_type();
-     const char* codecName = getCodecName(codecType);
+     const char* codecName = (codecType == ESP_A2D_MCT_NON_A2DP) ? g_a2dp.get_vendor_codec_name() : getCodecName(codecType);
      
      ESP_LOGI(TAG, "========================================");
      ESP_LOGI(TAG, "CODEC CONFIGURATION RECEIVED");
@@ -1582,6 +1588,8 @@ static void doPairingMode() {
      // - "configure aptX-HD codec" for aptX-HD (Vendor ID: 0x00D7, Codec ID: 0x0024)
      
      ESP_LOGI(TAG, "========================================");
+
+     OledDisplay::instance().setCodecInfo(codecName, rate, bps);
      
      // Pause pipeline during codec reconfiguration to prevent race conditions.
      g_codecReconfiguring = true;
@@ -1661,8 +1669,9 @@ static void doPairingMode() {
  #endif
  
      while (true) {
+         if (g_inputMode == MODE_LINE) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
          ulTaskNotifyTake(pdTRUE, waitTicks);
- 
+        
          uint32_t chunks = 0;
          while (g_pipeline.renderAvailable(g_dsp, g_i2s)) {
              // i2s.write() already blocks/yields on DMA room. Do not sleep for a
@@ -1692,6 +1701,8 @@ static void doPairingMode() {
      }
      
      ESP_LOGI(TAG, ">>> A2DP Connection: %s", stateStr);
+
+     OledDisplay::instance().setConnected(state == ESP_A2D_CONNECTION_STATE_CONNECTED);
      
      // Set connection timestamp early (on CONNECTING) to ensure grace period works
      // Volume events can arrive before CONNECTED state
@@ -1717,10 +1728,13 @@ static void doPairingMode() {
          // (pairing mode handler sets these intentionally and they should persist)
          if (!g_pairingModeActive) {
              g_sampleRate = APP_I2S_DEFAULT_SAMPLE_RATE;  // Reset sample rate for sound effects
-             
-             g_a2dp.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
-             ESP_LOGI(TAG, "Discoverability enabled after disconnect");
-             
+
+             if (g_inputMode == MODE_BT){
+                g_a2dp.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
+                ESP_LOGI(TAG, "Discoverability enabled after disconnect");
+                OledDisplay::instance().setBottomText("Waiting for connection . . .");
+                // g_sound.play(SOUND_PAIRING, g_i2s.getSampleRate(), SOUND_MODE_EXCLUSIVE);
+             }
              // Stop pairing animation if running (only if not intentionally in pairing mode)
              #ifdef CONFIG_LED_MATRIX_ENABLE
              LedController::getInstance().setPairingMode(false);
@@ -1729,6 +1743,7 @@ static void doPairingMode() {
              ESP_LOGI(TAG, "In pairing mode - keeping discoverable and LED animation active");
          }
      } else if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+         OledDisplay::instance().setBottomText("Loading . . .");
          ESP_LOGI(TAG, "A2DP connected - codec should already be configured");
          
          // Mark as connected
@@ -1784,6 +1799,10 @@ static void doPairingMode() {
      }
      
      ESP_LOGI(TAG, ">>> A2DP Audio State: %s", stateStr);
+
+     OledDisplay::instance().setPlaying(state == ESP_A2D_AUDIO_STATE_STARTED);
+    //  g_isPlaying = (state == ESP_A2D_AUDIO_STATE_STARTED);   // also fixes doPlayPause's state tracking
+
      
      if (state == ESP_A2D_AUDIO_STATE_SUSPEND) {
          smooth30_dB = smooth60_dB = smooth100_dB = -60.0f;
@@ -1794,6 +1813,38 @@ static void doPairingMode() {
          g_ble.restartAdvertising();
      }
  }
+
+  // -----------------------------------------------------------
+ // Input Mode switching handler
+ // -----------------------------------------------------------
+
+static void switchToLineMode() {
+    g_settings.saveInputMode(1);
+    esp_restart();
+}
+
+static void switchToBTMode() {
+    g_settings.saveInputMode(0);
+    esp_restart();
+}
+
+static void toggleInputMode() {
+    if (g_inputMode == MODE_BT) switchToLineMode();
+    else switchToBTMode();
+}
+
+static void toggleLineInMute() {
+    if (g_inputMode == MODE_BT) return;
+    int level = gpio_get_level((gpio_num_t)APP_LINE_IN_RELAY_GPIO);
+    ESP_LOGI(TAG, "Line in relay gpio level: %d", level);
+    if (level) {
+        gpio_set_level((gpio_num_t)APP_LINE_IN_RELAY_GPIO, 0);
+        OledDisplay::instance().setBottomText("Muted");
+    } else {
+        gpio_set_level((gpio_num_t)APP_LINE_IN_RELAY_GPIO, 1);
+        OledDisplay::instance().setBottomText("Line Input Mode");
+    }
+}
  
  // -----------------------------------------------------------
  // Button handling task
@@ -1804,12 +1855,12 @@ static void doPairingMode() {
     //  bool lastBtn2 = true, btn2State = true;
     //  uint32_t debounce2 = 0;
 
-    bool lastPrev = true, lastPlay = true, lastNext = true, lastMode = true;
-    bool statePrev = true, statePlay = true, stateNext = true, stateMode = true;
-    uint32_t debouncePrev = 0, debouncePlay = 0, debounceNext = 0, debounceMode = 0;
-    uint32_t pressStartPrev = 0, pressStartPlay = 0, pressStartNext = 0, presStartMode = 0;
-    bool heldPrev = false, heldPlay = false, heldNext = false, heldMode = false;
-    uint32_t lastRepeatPrev = 0, lastRepeatNext = 0;
+    uint32_t play_press_ms = 0, mode_press_ms = 0, prev_press_ms = 0, next_press_ms = 0;
+    bool play_held = false, mode_held = false, prev_held = false, next_held = false;
+    bool play_long_fired = false, mode_long_fired = false, prev_long_fired = false, next_long_fired = false;
+    const uint32_t DEBOUNCE_MS = 50;
+    uint32_t prev_last_repeat_ms = 0, next_last_repeat_ms = 0;
+
 
     const uint32_t HOLD_THRESHOLD_MS = 500;
     const uint32_t REPEAT_INTERVAL_MS = 150;
@@ -1835,13 +1886,6 @@ static void doPairingMode() {
          const gpio_num_t ledBtnGpio = (gpio_num_t)19;  // Default
      #endif
      #endif
-
-     auto adjustVolume = [](int delta) {
-        int v = (int)g_dsp.getVolume() + delta;
-        if (v < 0) v = 0; 
-        if (v > 127) v = 127;
-        doVolumeSet((uint8_t)v);
-    };
  
      while (true) {
          uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
@@ -1873,64 +1917,81 @@ static void doPairingMode() {
              }
          }
 
-        // --- Prev (tap = prev track, hold = volume down) ---
-        bool rPrev = gpio_get_level((gpio_num_t)APP_BTN_PREV_GPIO);
-        if (rPrev != lastPrev) debouncePrev = now;
-        if ((now - debouncePrev) > 25 && rPrev != statePrev) {
-            statePrev = rPrev;
-            if (rPrev == 0) { pressStartPrev = now; heldPrev = false; }
-            else if (!heldPrev) doPrevTrack();
-        }
-        if (statePrev == 0 && (now - pressStartPrev) >= HOLD_THRESHOLD_MS) {
-            if (!heldPrev || (now - lastRepeatPrev) >= REPEAT_INTERVAL_MS) {
-                adjustVolume(-VOLUME_STEP);
-                heldPrev = true;
-                lastRepeatPrev = now;
+        bool play_btn = (gpio_get_level((gpio_num_t)APP_BTN_PLAY_GPIO) == 0);
+        if (play_btn && !play_held) {
+            play_press_ms = now; play_held = true; play_long_fired = false;
+        } else if (play_btn && play_held) {
+            if (!play_long_fired && now - play_press_ms >= 3000) {
+                play_long_fired = true;
+                if (g_inputMode == MODE_BT) doPairingMode();
             }
-        }
-        lastPrev = rPrev;
-
-        // --- Next (tap = next track, hold = volume up) ---
-        bool rNext = gpio_get_level((gpio_num_t)APP_BTN_NEXT_GPIO);
-        if (rNext != lastNext) debounceNext = now;
-        if ((now - debounceNext) > 25 && rNext != stateNext) {
-            stateNext = rNext;
-            if (rNext == 0) { pressStartNext = now; heldNext = false; }
-            else if (!heldNext) doNextTrack();
-        }
-        if (stateNext == 0 && (now - pressStartNext) >= HOLD_THRESHOLD_MS) {
-            if (!heldNext || (now - lastRepeatNext) >= REPEAT_INTERVAL_MS) {
-                adjustVolume(VOLUME_STEP);
-                heldNext = true;
-                lastRepeatNext = now;
+        } else if (!play_btn && play_held) {
+            play_held = false;
+            if (!play_long_fired && now - play_press_ms >= DEBOUNCE_MS) {
+                if (g_inputMode == MODE_BT) doPlayPause();
+                else if (g_inputMode == MODE_LINE) toggleLineInMute();
             }
+            play_long_fired = false;
         }
-        lastNext = rNext;
 
-        // --- Play ---
-        bool rPlay = gpio_get_level((gpio_num_t)APP_BTN_PLAY_GPIO);
-        if (rPlay != lastPlay) debouncePlay = now; 
-        if ((now - debouncePlay) > 25 && rPlay != statePlay) {
-            statePlay = rPlay;
-            if (rPlay == 0) { pressStartPlay = now; heldPlay = false; }
-            else if (!heldNext) doPlayPause();
+        bool mode_btn = (gpio_get_level((gpio_num_t)APP_BTN_MODE_GPIO) == 0);
+        if (mode_btn && !mode_held) {
+            mode_press_ms = now; mode_held = true; mode_long_fired = false;
+        } else if (mode_btn && mode_held) {
+            if (!mode_long_fired && now - mode_press_ms >= 1000) {
+                mode_long_fired = true;
+                toggleInputMode();
+            }
+        } else if (!mode_btn && mode_held) {
+            mode_held = false;
+            if (!mode_long_fired && now - mode_press_ms >= DEBOUNCE_MS)
+                OledDisplay::instance().cycleScreen();
+            mode_long_fired = false;
         }
-        if (statePlay == 0 && (now - pressStartPlay) >= 1500 && !heldPlay) { // exclusive 3 seconds for pairing mode
-            heldPlay = true;
-            doPairingMode();
-        }
-        lastPlay = rPlay;
 
-        // --- Mode (cycle screens, including Settings) ---
-        bool rMode = gpio_get_level((gpio_num_t)APP_BTN_MODE_GPIO);
-        if (rMode != lastMode) debounceMode = now;
-        if ((now - debounceMode) > 25 && rMode != stateMode) {
-            stateMode = rMode;
-            if (rMode == 0) OledDisplay::instance().cycleScreen();
+        bool prev_btn = (gpio_get_level((gpio_num_t)APP_BTN_PREV_GPIO) == 0);
+        if (prev_btn && !prev_held) {
+            prev_press_ms = now; prev_held = true; prev_long_fired = false;
+            prev_last_repeat_ms = now;
+        } else if (prev_btn && prev_held) {
+            if (now - prev_press_ms >= HOLD_THRESHOLD_MS && now - prev_last_repeat_ms >= REPEAT_INTERVAL_MS) {
+                prev_long_fired = true;
+                if (g_inputMode == MODE_BT) g_a2dp.volume_down();
+                prev_last_repeat_ms = now;
+            }
+        } else if (!prev_btn && prev_held) {
+            prev_held = false;
+            if (!prev_long_fired && now - prev_press_ms >= DEBOUNCE_MS) {
+                if (OledDisplay::instance().screenMode() == SCREEN_WAVE)
+                    OledDisplay::instance().decreaseWaveGain();
+                else
+                    if (g_inputMode == MODE_BT) doPrevTrack();
+            }
+            prev_long_fired = false;
         }
-        lastMode = rMode;
 
-         vTaskDelay(pdMS_TO_TICKS(10));
+        bool next_btn = (gpio_get_level((gpio_num_t)APP_BTN_NEXT_GPIO) == 0);
+        if (next_btn && !next_held) {
+            next_press_ms = now; next_held = true; next_long_fired = false;
+            next_last_repeat_ms = now;
+        } else if (next_btn && next_held) {
+            if (now - next_press_ms >= HOLD_THRESHOLD_MS && now - next_last_repeat_ms >= REPEAT_INTERVAL_MS) {
+                next_long_fired = true;
+                if (g_inputMode == MODE_BT) g_a2dp.volume_up();
+                next_last_repeat_ms = now;
+            }
+        } else if (!next_btn && next_held) {
+            next_held = false;
+            if (!next_long_fired && now - next_press_ms >= DEBOUNCE_MS) {
+                if (OledDisplay::instance().screenMode() == SCREEN_WAVE)
+                    OledDisplay::instance().increaseWaveGain();
+                else
+                    if (g_inputMode == MODE_BT) doNextTrack();
+            }
+            next_long_fired = false;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
      }
  }
  
@@ -2043,7 +2104,14 @@ static void doPairingMode() {
          btn_cfg.pin_bit_mask = (1ULL << APP_BUTTON1_GPIO);
          btn_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
          gpio_config(&btn_cfg);
-         
+
+         // line input relay
+         gpio_config_t relay_io = {};
+         relay_io.pin_bit_mask = (1ULL << APP_LINE_IN_RELAY_GPIO);
+         relay_io.mode = GPIO_MODE_INPUT_OUTPUT;
+         gpio_config(&relay_io);
+         gpio_set_level((gpio_num_t)APP_LINE_IN_RELAY_GPIO, 0);   // default: BT mode, relay low
+
          // Read button state (active low = pressed when 0)
          bool buttonPressed = (gpio_get_level((gpio_num_t)APP_BUTTON1_GPIO) == 0);
          
@@ -2129,7 +2197,7 @@ static void doPairingMode() {
      g_settings.load();
      bool bassBoost, channelFlip, bypass;
      int8_t eqBass, eqMid, eqTreble;
-     std::string deviceName;
+    //  std::string deviceName;
      bool soundMuted;
      g_settings.getControl(bassBoost, channelFlip, bypass);
      g_settings.getEQ(eqBass, eqMid, eqTreble);
@@ -2265,176 +2333,191 @@ static void doPairingMode() {
      
      #else
      // No LED matrix - just play startup sound and wait for completion
-     if (g_sound.hasSound(SOUND_STARTUP)) {
-         ESP_LOGI(TAG, "Playing startup sound...");
-         g_sound.play(SOUND_STARTUP, g_i2s.getSampleRate(), SOUND_MODE_EXCLUSIVE);
-         while (g_sound.isPlaying()) {
-             vTaskDelay(pdMS_TO_TICKS(50));
-         }
-         ESP_LOGI(TAG, "Startup sound complete");
-     }
      #endif
      // ========================================================================
      // END STARTUP SEQUENCE - Now initialize BLE, A2DP, and other services
      // ========================================================================
  
-     // Centralized Bluetooth stack initialization (shared for BLE + Classic BT)
-     // This must be done once before any BLE or A2DP profile registration.
-     {
-         esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-         esp_err_t err = esp_bt_controller_init(&bt_cfg);
-         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-             ESP_LOGE(TAG, "BT controller init failed: %s", esp_err_to_name(err));
-         }
-         err = esp_bt_controller_enable(ESP_BT_MODE_BTDM);
-         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-             ESP_LOGE(TAG, "BT controller enable failed: %s", esp_err_to_name(err));
-         }
-         esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
-         bluedroid_cfg.ssp_en = true;
-         err = esp_bluedroid_init_with_cfg(&bluedroid_cfg);
-         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-             ESP_LOGE(TAG, "Bluedroid init failed: %s", esp_err_to_name(err));
-         }
-         err = esp_bluedroid_enable();
-         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-             ESP_LOGE(TAG, "Bluedroid enable failed: %s", esp_err_to_name(err));
-         }
-         logHeap("after_bt_stack");
+     uint8_t savedMode = g_settings.loadInputMode();
+     if (savedMode == 1) {
+        g_inputMode = MODE_LINE;
+        gpio_set_level((gpio_num_t)APP_LINE_IN_RELAY_GPIO, 1);
+        OledDisplay::instance().setInputMode(MODE_LINE);
+        OledDisplay::instance().setBottomText("Line Input Mode");
+        // skip g_a2dp.start() entirely this boot — device comes up already in Line mode
+        ESP_LOGI(TAG, "Started up as Line Input Mode");
+     } else {
+        g_inputMode = MODE_BT;
+        if (g_sound.hasSound(SOUND_STARTUP)) {
+            OledDisplay::instance().setBottomText("Starting Bluetooth . . .");
+            ESP_LOGI(TAG, "Playing startup sound...");
+            g_sound.play(SOUND_STARTUP, g_i2s.getSampleRate(), SOUND_MODE_EXCLUSIVE);
+            //  while (g_sound.isPlaying()) {
+            //      vTaskDelay(pdMS_TO_TICKS(50));
+            //  }
+            //  ESP_LOGI(TAG, "Startup sound complete");
+        }
+        // Centralized Bluetooth stack initialization (shared for BLE + Classic BT)
+        // This must be done once before any BLE or A2DP profile registration.
+        {
+            esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+            esp_err_t err = esp_bt_controller_init(&bt_cfg);
+            if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+                ESP_LOGE(TAG, "BT controller init failed: %s", esp_err_to_name(err));
+            }
+            err = esp_bt_controller_enable(ESP_BT_MODE_BTDM);
+            if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+                ESP_LOGE(TAG, "BT controller enable failed: %s", esp_err_to_name(err));
+            }
+            esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
+            bluedroid_cfg.ssp_en = true;
+            err = esp_bluedroid_init_with_cfg(&bluedroid_cfg);
+            if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+                ESP_LOGE(TAG, "Bluedroid init failed: %s", esp_err_to_name(err));
+            }
+            err = esp_bluedroid_enable();
+            if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+                ESP_LOGE(TAG, "Bluedroid enable failed: %s", esp_err_to_name(err));
+            }
+            logHeap("after_bt_stack");
+        }
+
+        // Initialize BLE
+        #ifdef CONFIG_LED_MATRIX_ENABLE
+        // Unified BLE callbacks: EQ, EqPreset, Control, Name, LED, LedEffect, LedBright, SoundMute, SoundDelete, SoundData, OTA
+        g_ble.setCallbacks(
+            onBleEq,            // EqCallback
+            onBleEqPreset,      // EqPresetCallback
+            onBleControl,       // ControlCallback
+            onBleName,          // NameCallback
+            onBleLedSettings,   // LedCallback (full 10-byte settings)
+            onBleLedEffect,     // LedEffectCallback
+            onBleLedBrightness, // LedBrightnessCallback
+            onBleSoundMute,     // SoundMuteCallback
+            onBleSoundDelete,   // SoundDeleteCallback
+            onBleSoundUpload,   // SoundDataCallback
+            onBleOtaUnified     // OtaCallback
+        );
+        uint8_t savedLedEffect = g_settings.loadLedEffect();
+        uint8_t savedBrightness = LedController::getInstance().getBrightness();
+        g_ble.init(deviceName.c_str(), APP_FW_VERSION, getControlByte(), eqBass, eqMid, eqTreble, savedLedEffect, savedBrightness);
+        #else
+        // Unified BLE callbacks without LED matrix
+        g_ble.setCallbacks(
+            onBleEq,            // EqCallback
+            onBleEqPreset,      // EqPresetCallback
+            onBleControl,       // ControlCallback
+            onBleName,          // NameCallback
+            nullptr,            // LedCallback (no LED)
+            nullptr,            // LedEffectCallback
+            nullptr,            // LedBrightnessCallback
+            onBleSoundMute,     // SoundMuteCallback
+            onBleSoundDelete,   // SoundDeleteCallback
+            onBleSoundUpload,   // SoundDataCallback
+            onBleOtaUnified     // OtaCallback
+        );
+        g_ble.init(deviceName.c_str(), APP_FW_VERSION, getControlByte(), eqBass, eqMid, eqTreble);
+        #endif
+        
+        // Initialize BLE sound status with current sound player status
+        // This ensures the correct status is sent when a client connects
+        g_ble.setSoundStatus(g_sound.getStatus());
+        logHeap("after_ble");
+
+        g_ble.setDisconnectCallback([]() {
+            if (g_soundUploadActive) {
+                abortSoundUpload(0x0B, false);
+            }
+            ESP_LOGI(TAG, "BLE disconnect - internal heap free=%u min_ever=%u",
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        });
+
+        // ========================================================================
+        // A2DP Initialization
+        // ========================================================================
+        
+        // Delay before A2DP initialization to avoid AVRCP race condition
+        // ESP-IDF Bluetooth stack has a bug where simultaneous AVRCP connection attempts
+        // can crash in bta_av_rc_create - waiting allows the phone's connection attempt
+        // to start first and avoids the race condition
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // Start A2DP
+        g_a2dp.set_output_active(false);
+        g_a2dp.set_stream_reader(onStreamData, false);
+        g_a2dp.set_codec_config_callback(onCodecConfig);
+        g_a2dp.set_auto_reconnect(true, 3);
+        g_a2dp.set_task_core(1);
+        g_a2dp.set_on_connection_state_changed(onConnectionState);
+        g_a2dp.set_on_audio_state_changed(onAudioState);
+        
+        // Volume change callback - sync with LED and encoder controller
+        g_a2dp.set_avrc_rn_volumechange([](int volume) {
+            g_dsp.setVolume((uint8_t)volume);
+            #ifdef CONFIG_LED_MATRIX_ENABLE
+            LedController::getInstance().setVolume((uint8_t)volume);
+            #endif
+            #ifdef CONFIG_ENCODER_ENABLE
+            // Sync encoder controller with phone's volume so local adjustments are relative
+            EncoderController::getInstance().setCurrentVolume((uint8_t)volume);
+            ESP_LOGI(TAG, "Phone volume changed to %d - encoder synced", volume);
+            #endif
+            
+            OledDisplay::instance().setVolume((uint8_t)volume);
+
+            // Skip max volume sound during connection grace period (ignore initial volume report)
+            // Also skip if g_lastConnectTime is 0 (no connection yet - system still initializing)
+            int64_t timeSinceConnect = esp_timer_get_time() - g_lastConnectTime;
+            if (g_lastConnectTime == 0 || timeSinceConnect < VOLUME_GRACE_PERIOD_US) {
+                ESP_LOGI(TAG, "Ignoring volume report during connection grace period (%lld ms)", 
+                        timeSinceConnect / 1000);
+                return;
+            }
+            
+            // Play max volume sound when hitting maximum.
+            // IMPORTANT: never use exclusive mode while A2DP is connected. The audio
+            // render task must remain the only I2S writer; the sound effect is mixed
+            // through OverlayMixer so I2S/DMA state cannot be corrupted.
+            // Only play if we're actually connected (not during connection setup)
+            // Rate limit: 2 second cooldown to prevent crash from rapid volume spam
+            if (volume >= 127 && g_a2dpConnected && g_sound.hasSound(SOUND_MAX_VOLUME)) {
+                int64_t now = esp_timer_get_time();
+                int64_t timeSinceLastMaxSound = now - g_lastMaxVolumeSound;
+                if (timeSinceLastMaxSound >= MAX_VOLUME_SOUND_COOLDOWN_US) {
+                    ESP_LOGI(TAG, "Max volume reached - playing sound");
+                    g_lastMaxVolumeSound = now;
+                    // Do not clear the overlay from the AVRCP/BT callback. startOverlay()
+                    // clears stale frames inside the sound task path, and calling clear()
+                    // here can block the BT control task if the render task owns the
+                    // overlay mutex. The max-volume sound is overlay-only; it never
+                    // touches I2S directly.
+                    g_sound.play(SOUND_MAX_VOLUME, g_i2s.getSampleRate(), SOUND_MODE_OVERLAY);
+                } else {
+                    ESP_LOGD(TAG, "Max volume sound rate limited (%lld ms since last)", 
+                            timeSinceLastMaxSound / 1000);
+                }
+            }
+        });
+        g_a2dp.start(deviceName.c_str());
+        logHeap("after_a2dp");
+
+        // Wait for A2DP stack to fully initialize before changing discoverability
+        // The library sets connectable=true during init, we need to override after
+        // Longer delay to allow AVRCP connection to stabilize (ESP-IDF race condition workaround)
+        vTaskDelay(pdMS_TO_TICKS(500));
+        
+        // Keep discoverable at startup so the phone can always recover after a bad bond
+        // or codec negotiation failure. Pairing mode can still be used for feedback UI.
+
+        g_a2dp.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
+        ESP_LOGI(TAG, "A2DP started as '%s' - discoverable/connectable", deviceName.c_str());
+        logHeap("after_bt_ready");
+        OledDisplay::instance().setBottomText("Waiting for connection . . .");
+        // existing g_a2dp.start() boot path runs as normal
+        ESP_LOGI(TAG, "Started up as Bluetooth Mode");
      }
- 
-     // Initialize BLE
-     #ifdef CONFIG_LED_MATRIX_ENABLE
-     // Unified BLE callbacks: EQ, EqPreset, Control, Name, LED, LedEffect, LedBright, SoundMute, SoundDelete, SoundData, OTA
-     g_ble.setCallbacks(
-         onBleEq,            // EqCallback
-         onBleEqPreset,      // EqPresetCallback
-         onBleControl,       // ControlCallback
-         onBleName,          // NameCallback
-         onBleLedSettings,   // LedCallback (full 10-byte settings)
-         onBleLedEffect,     // LedEffectCallback
-         onBleLedBrightness, // LedBrightnessCallback
-         onBleSoundMute,     // SoundMuteCallback
-         onBleSoundDelete,   // SoundDeleteCallback
-         onBleSoundUpload,   // SoundDataCallback
-         onBleOtaUnified     // OtaCallback
-     );
-     uint8_t savedLedEffect = g_settings.loadLedEffect();
-     uint8_t savedBrightness = LedController::getInstance().getBrightness();
-     g_ble.init(deviceName.c_str(), APP_FW_VERSION, getControlByte(), eqBass, eqMid, eqTreble, savedLedEffect, savedBrightness);
-     #else
-     // Unified BLE callbacks without LED matrix
-     g_ble.setCallbacks(
-         onBleEq,            // EqCallback
-         onBleEqPreset,      // EqPresetCallback
-         onBleControl,       // ControlCallback
-         onBleName,          // NameCallback
-         nullptr,            // LedCallback (no LED)
-         nullptr,            // LedEffectCallback
-         nullptr,            // LedBrightnessCallback
-         onBleSoundMute,     // SoundMuteCallback
-         onBleSoundDelete,   // SoundDeleteCallback
-         onBleSoundUpload,   // SoundDataCallback
-         onBleOtaUnified     // OtaCallback
-     );
-     g_ble.init(deviceName.c_str(), APP_FW_VERSION, getControlByte(), eqBass, eqMid, eqTreble);
-     #endif
-     
-     // Initialize BLE sound status with current sound player status
-     // This ensures the correct status is sent when a client connects
-     g_ble.setSoundStatus(g_sound.getStatus());
-     logHeap("after_ble");
- 
-     g_ble.setDisconnectCallback([]() {
-         if (g_soundUploadActive) {
-             abortSoundUpload(0x0B, false);
-         }
-         ESP_LOGI(TAG, "BLE disconnect - internal heap free=%u min_ever=%u",
-                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                  (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-     });
- 
-     // ========================================================================
-     // A2DP Initialization
-     // ========================================================================
-     
-     // Delay before A2DP initialization to avoid AVRCP race condition
-     // ESP-IDF Bluetooth stack has a bug where simultaneous AVRCP connection attempts
-     // can crash in bta_av_rc_create - waiting allows the phone's connection attempt
-     // to start first and avoids the race condition
-     vTaskDelay(pdMS_TO_TICKS(1000));
-     
-     // Start A2DP
-     g_a2dp.set_output_active(false);
-     g_a2dp.set_stream_reader(onStreamData, false);
-     g_a2dp.set_codec_config_callback(onCodecConfig);
-     g_a2dp.set_auto_reconnect(true, 3);
-     g_a2dp.set_task_core(1);
-     g_a2dp.set_on_connection_state_changed(onConnectionState);
-     g_a2dp.set_on_audio_state_changed(onAudioState);
-     
-     // Volume change callback - sync with LED and encoder controller
-     g_a2dp.set_avrc_rn_volumechange([](int volume) {
-         g_dsp.setVolume((uint8_t)volume);
-         #ifdef CONFIG_LED_MATRIX_ENABLE
-         LedController::getInstance().setVolume((uint8_t)volume);
-         #endif
-         #ifdef CONFIG_ENCODER_ENABLE
-         // Sync encoder controller with phone's volume so local adjustments are relative
-         EncoderController::getInstance().setCurrentVolume((uint8_t)volume);
-         ESP_LOGI(TAG, "Phone volume changed to %d - encoder synced", volume);
-         #endif
-         
-         OledDisplay::instance().setVolume((uint8_t)volume);
-         
-         // Skip max volume sound during connection grace period (ignore initial volume report)
-         // Also skip if g_lastConnectTime is 0 (no connection yet - system still initializing)
-         int64_t timeSinceConnect = esp_timer_get_time() - g_lastConnectTime;
-         if (g_lastConnectTime == 0 || timeSinceConnect < VOLUME_GRACE_PERIOD_US) {
-             ESP_LOGI(TAG, "Ignoring volume report during connection grace period (%lld ms)", 
-                      timeSinceConnect / 1000);
-             return;
-         }
-         
-         // Play max volume sound when hitting maximum.
-         // IMPORTANT: never use exclusive mode while A2DP is connected. The audio
-         // render task must remain the only I2S writer; the sound effect is mixed
-         // through OverlayMixer so I2S/DMA state cannot be corrupted.
-         // Only play if we're actually connected (not during connection setup)
-         // Rate limit: 2 second cooldown to prevent crash from rapid volume spam
-         if (volume >= 122 && g_a2dpConnected && g_sound.hasSound(SOUND_MAX_VOLUME)) {
-             int64_t now = esp_timer_get_time();
-             int64_t timeSinceLastMaxSound = now - g_lastMaxVolumeSound;
-             if (timeSinceLastMaxSound >= MAX_VOLUME_SOUND_COOLDOWN_US) {
-                 ESP_LOGI(TAG, "Max volume reached - playing sound");
-                 g_lastMaxVolumeSound = now;
-                 // Do not clear the overlay from the AVRCP/BT callback. startOverlay()
-                 // clears stale frames inside the sound task path, and calling clear()
-                 // here can block the BT control task if the render task owns the
-                 // overlay mutex. The max-volume sound is overlay-only; it never
-                 // touches I2S directly.
-                 g_sound.play(SOUND_MAX_VOLUME, g_i2s.getSampleRate(), SOUND_MODE_OVERLAY);
-             } else {
-                 ESP_LOGD(TAG, "Max volume sound rate limited (%lld ms since last)", 
-                          timeSinceLastMaxSound / 1000);
-             }
-         }
-     });
-     
-     g_a2dp.start(deviceName.c_str());
-     logHeap("after_a2dp");
- 
-     // Wait for A2DP stack to fully initialize before changing discoverability
-     // The library sets connectable=true during init, we need to override after
-     // Longer delay to allow AVRCP connection to stabilize (ESP-IDF race condition workaround)
-     vTaskDelay(pdMS_TO_TICKS(500));
-     
-     // Keep discoverable at startup so the phone can always recover after a bad bond
-     // or codec negotiation failure. Pairing mode can still be used for feedback UI.
-     g_a2dp.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
-     ESP_LOGI(TAG, "A2DP started as '%s' - discoverable/connectable", deviceName.c_str());
-     logHeap("after_bt_ready");
- 
+
      // Log memory status before starting tasks
      ESP_LOGI(TAG, "Free heap: internal=%u KB",
               (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024));

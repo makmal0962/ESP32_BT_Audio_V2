@@ -216,6 +216,7 @@ void NativeA2DPSink::av_hdl_a2d_evt(uint16_t event, void *p_param) {
                 if (ch_bits == A2DP_LDAC_CHANNEL_MODE_MONO) ch = 1;
                 // LDACBT decoder outputs LDACBT_SMPL_FMT_S24 (24-bit)
                 bits = 24;
+                strcpy(m_vendorCodecName, "LDAC");
                 ESP_LOGI(BT_AV_TAG, "Detected LDAC codec sr=%u ch=%u", sr, ch);
             } else if (vendorId == 0x0000004F && codecId == 0x0001) {
                 // aptX Classic: aptx_decode32 outputs 24-bit in 32-bit LE containers
@@ -224,6 +225,7 @@ void NativeA2DPSink::av_hdl_a2d_evt(uint16_t event, void *p_param) {
                 else if (sr_ch & 0x10) sr = 48000;
                 if ((sr_ch & 0x0F) == 0x01) ch = 1;
                 bits = 32;
+                strcpy(m_vendorCodecName, "aptX");
                 ESP_LOGI(BT_AV_TAG, "Detected aptX codec sr=%u ch=%u", sr, ch);
             } else if (vendorId == 0x000000D7 && codecId == 0x0024) {
                 // aptX-HD: aptx_decode32 outputs 24-bit in 32-bit LE containers
@@ -232,11 +234,13 @@ void NativeA2DPSink::av_hdl_a2d_evt(uint16_t event, void *p_param) {
                 else if (sr_ch & 0x10) sr = 48000;
                 if ((sr_ch & 0x0F) == 0x01) ch = 1;
                 bits = 32;
+                strcpy(m_vendorCodecName, "aptX HD");
                 ESP_LOGI(BT_AV_TAG, "Detected aptX-HD codec sr=%u ch=%u", sr, ch);
             } else if (vendorId == 0x0000000A && codecId == 0x0002) {
                 // aptX-LL
                 bits = 32;
                 sr = 48000;
+                strcpy(m_vendorCodecName, "aptX LL");
                 ESP_LOGI(BT_AV_TAG, "Detected aptX-LL codec sr=%u ch=%u", sr, ch);
             } else if (vendorId == A2DP_OPUS_VENDOR_ID && codecId == A2DP_OPUS_CODEC_ID) {
                 // A2DP Opus vendor codec. The ESP-IDF Opus decoder path outputs
@@ -246,10 +250,12 @@ void NativeA2DPSink::av_hdl_a2d_evt(uint16_t event, void *p_param) {
                 bits = 16;
                 ch = raw[6];
                 if (ch == 0 || ch > 2) ch = 2;
+                strcpy(m_vendorCodecName, "Opus");
                 ESP_LOGI(BT_AV_TAG, "Detected Opus codec sr=%u bits=%u ch=%u coupled=%u",
                          sr, bits, ch, raw[7]);
             } else {
                 sr = 48000; bits = 32;
+                snprintf(m_vendorCodecName, sizeof(m_vendorCodecName), "Vendor %04X", codecId);
                 ESP_LOGI(BT_AV_TAG, "Unknown vendor codec vendorId=0x%08X codecId=0x%04X", vendorId, codecId);
             }
         }
@@ -332,7 +338,7 @@ void NativeA2DPSink::previous()    { execute_avrc_command(ESP_AVRC_PT_CMD_BACKWA
 void NativeA2DPSink::fast_forward(){ execute_avrc_command(ESP_AVRC_PT_CMD_FAST_FORWARD); }
 void NativeA2DPSink::rewind()      { execute_avrc_command(ESP_AVRC_PT_CMD_REWIND); }
 
-void NativeA2DPSink::volume_up()   { volume_set_by_local_host((s_volume + 5) & 0x7f); }
+void NativeA2DPSink::volume_up()   { volume_set_by_local_host(s_volume < 125 ? s_volume + 5 : 127); }
 void NativeA2DPSink::volume_down() { volume_set_by_local_host(s_volume > 5 ? s_volume - 5 : 0); }
 void NativeA2DPSink::set_volume(uint8_t v) { volume_set_by_local_host(v & 0x7f); }
 int  NativeA2DPSink::get_volume()  { _lock_acquire(&s_volume_lock); int v=s_volume; _lock_release(&s_volume_lock); return v; }

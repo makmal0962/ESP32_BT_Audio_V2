@@ -74,6 +74,7 @@ public:
 
     // Discoverability / scan mode
     void set_discoverability(esp_bt_discovery_mode_t mode);
+    void set_scan_mode_connectable(bool connectable);
 
     // Connection management
     esp_a2d_connection_state_t get_connection_state();
@@ -85,6 +86,9 @@ public:
     void set_output_active(bool active);
 
     esp_bd_addr_t* get_current_peer_address();
+
+    // Get vendor codec name
+    const char* get_vendor_codec_name() const { return m_vendorCodecName; }
 
 private:
     static constexpr const char* TAG = "NativeA2DP";
@@ -166,9 +170,10 @@ private:
     void av_new_track();
     void av_playback_changed();
     void av_play_pos_changed();
-    void set_scan_mode_connectable(bool connectable);
 
     bool has_last_connection();
     void get_last_connection();
     void set_last_connection(esp_bd_addr_t bda);
+
+    char m_vendorCodecName[16] = "Vendor";
 };
