@@ -49,7 +49,7 @@ void NativeA2DPSink::init_bluetooth() {
     // Bluetooth controller and bluedroid are initialized centrally in main.cpp
     // to avoid double-init when both BLE and Classic BT (A2DP) are used.
     esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
-    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_IO;
+    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
     esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
     esp_bt_pin_type_t pin_type = ESP_BT_PIN_TYPE_FIXED;
     esp_bt_pin_code_t pin_code; pin_code[0]='1'; pin_code[1]='2'; pin_code[2]='3'; pin_code[3]='4';
@@ -120,6 +120,12 @@ void NativeA2DPSink::av_hdl_stack_evt(uint16_t event, void *p_param) {
     esp_a2d_sink_register_data_callback(data_cb_trampoline);
     esp_err_t scan_err = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE); ESP_LOGI(TAG, "set_scan_mode: %s", esp_err_to_name(scan_err));
     if (scan_err != ESP_OK) { ESP_LOGE(TAG, "set_scan_mode failed: %s", esp_err_to_name(scan_err)); }
+    if (reconnect_status == AutoReconnect && has_last_connection()) {
+        get_last_connection();
+        ESP_LOGI(TAG, "Attempting auto-reconnect to last paired device");
+        esp_err_t connErr = esp_a2d_sink_connect(last_connection);
+        ESP_LOGI(TAG, "esp_a2d_sink_connect: %s", esp_err_to_name(connErr));
+    }
 }
 
 void NativeA2DPSink::gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
@@ -134,6 +140,16 @@ void NativeA2DPSink::gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *
         break;
     case ESP_BT_GAP_MODE_CHG_EVT:
         ESP_LOGI(BT_AV_TAG, "mode_chg: %d", param->mode_chg.mode);
+        break;
+    case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
+        if (param->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS) {
+            strncpy(m_peerName, (const char*)param->read_rmt_name.rmt_name, sizeof(m_peerName) - 1);
+            m_peerName[sizeof(m_peerName) - 1] = '\0';
+            if (peername_cb) peername_cb(m_peerName);
+            ESP_LOGI(BT_AV_TAG, "Peer name resolved: %s", m_peerName);
+        } else {
+            ESP_LOGW(BT_AV_TAG, "Read remote name failed, stat=%d", param->read_rmt_name.stat);
+        }
         break;
     default: break;
     }
@@ -153,12 +169,14 @@ void NativeA2DPSink::av_hdl_a2d_evt(uint16_t event, void *p_param) {
             connection_state, bda[0],bda[1],bda[2],bda[3],bda[4],bda[5]);
         if (connection_state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             esp_err_t scan_err = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE); ESP_LOGI(TAG, "set_scan_mode: %s", esp_err_to_name(scan_err));
-    if (scan_err != ESP_OK) { ESP_LOGE(TAG, "set_scan_mode failed: %s", esp_err_to_name(scan_err)); }
+            if (scan_err != ESP_OK) { ESP_LOGE(TAG, "set_scan_mode failed: %s", esp_err_to_name(scan_err)); }
             memcpy(peer_bd_addr, bda, ESP_BD_ADDR_LEN);
         } else if (connection_state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
             memcpy(peer_bd_addr, bda, ESP_BD_ADDR_LEN);
             set_last_connection(peer_bd_addr);
+            esp_err_t nameErr = esp_bt_gap_read_remote_name(bda);
+            ESP_LOGI(BT_AV_TAG, "read_remote_name request: %s", esp_err_to_name(nameErr));
         }
         if (connection_state_cb) connection_state_cb(connection_state, this);
         break;
@@ -299,6 +317,35 @@ void NativeA2DPSink::av_hdl_avrc_ct_evt(uint16_t event, void *p_param) {
         s_avrc_peer_rn_cap.bits = rc->get_rn_caps_rsp.evt_set.bits;
         av_new_track(); av_playback_changed(); av_play_pos_changed();
         break;
+    case ESP_AVRC_CT_METADATA_RSP_EVT: {
+        int len = rc->meta_rsp.attr_length;
+        if (rc->meta_rsp.attr_id == ESP_AVRC_MD_ATTR_PLAYING_TIME) {
+            char buf[16] = {};
+            size_t n = (size_t)len < sizeof(buf) - 1 ? (size_t)len : sizeof(buf) - 1;
+            memcpy(buf, rc->meta_rsp.attr_text, n);
+            buf[n] = '\0';
+            uint32_t durationMs = (uint32_t)strtoul(buf, nullptr, 10);
+            ESP_LOGI(BT_RC_CT_TAG, "Duration: %lu ms", (unsigned long)durationMs);
+            if (duration_cb) duration_cb(durationMs);
+            break;
+        }
+        char *dst = nullptr;
+        size_t dstSize = 0;
+        switch (rc->meta_rsp.attr_id) {
+            case ESP_AVRC_MD_ATTR_TITLE:  dst = m_trackTitle;  dstSize = sizeof(m_trackTitle);  break;
+            case ESP_AVRC_MD_ATTR_ARTIST: dst = m_trackArtist; dstSize = sizeof(m_trackArtist); break;
+            case ESP_AVRC_MD_ATTR_ALBUM:  dst = m_trackAlbum;  dstSize = sizeof(m_trackAlbum);  break;
+            default: break;
+        }
+        if (dst && len > 0) {
+            size_t n = (size_t)len < dstSize - 1 ? (size_t)len : dstSize - 1;
+            memcpy(dst, rc->meta_rsp.attr_text, n);
+            dst[n] = '\0';
+            ESP_LOGI(BT_RC_CT_TAG, "Metadata attr_id=0x%02x: \"%s\"", rc->meta_rsp.attr_id, dst);
+            if (metadata_cb) metadata_cb(m_trackTitle, m_trackArtist, m_trackAlbum);
+        }
+        break;
+    }
     default: break;
     }
 }
@@ -367,8 +414,17 @@ void NativeA2DPSink::volume_set_by_local_host(uint8_t volume) {
 void NativeA2DPSink::av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *event_parameter) {
     switch (event_id) {
     case ESP_AVRC_RN_TRACK_CHANGE: av_new_track(); break;
-    case ESP_AVRC_RN_PLAY_STATUS_CHANGE: av_playback_changed(); break;
-    case ESP_AVRC_RN_PLAY_POS_CHANGED: av_play_pos_changed(); break;
+    case ESP_AVRC_RN_PLAY_STATUS_CHANGE:
+        m_playStatus = event_parameter->playback;
+        ESP_LOGI(BT_RC_CT_TAG, "Playback status changed: %d", (int)m_playStatus);
+        if (playstatus_cb) playstatus_cb(m_playStatus);
+        av_playback_changed();
+        break;
+    case ESP_AVRC_RN_PLAY_POS_CHANGED:
+        ESP_LOGI(BT_RC_CT_TAG, "Position: %lu ms", (unsigned long)event_parameter->play_pos);
+        if (position_cb) position_cb(event_parameter->play_pos);
+        av_play_pos_changed();
+        break;
     case ESP_AVRC_RN_VOLUME_CHANGE:
         volume_set_by_controller(event_parameter->volume);
         break;
@@ -379,6 +435,12 @@ void NativeA2DPSink::av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t
 void NativeA2DPSink::av_new_track() {
     if (esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_TEST, &s_avrc_peer_rn_cap, ESP_AVRC_RN_TRACK_CHANGE))
         esp_avrc_ct_send_register_notification_cmd(2, ESP_AVRC_RN_TRACK_CHANGE, 0);
+
+    // Get AVRCP metadata
+    m_trackTitle[0] = m_trackArtist[0] = m_trackAlbum[0] = '\0';
+    uint8_t attrMask = ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST | ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_PLAYING_TIME;
+    esp_err_t err = esp_avrc_ct_send_metadata_cmd(1, attrMask);
+    ESP_LOGI(BT_RC_CT_TAG, "Requested track metadata: %s", esp_err_to_name(err));
 }
 void NativeA2DPSink::av_playback_changed() {
     if (esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_TEST, &s_avrc_peer_rn_cap, ESP_AVRC_RN_PLAY_STATUS_CHANGE))

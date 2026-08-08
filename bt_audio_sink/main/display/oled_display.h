@@ -4,7 +4,20 @@
 #include "audio_tap.h"
 #include "bintobar_generated.h"   // bring over unchanged, format-independent
 
-enum ScreenMode { SCREEN_MAIN, SCREEN_FFT, SCREEN_WAVE, SCREEN_COUNT };
+enum ScreenMode { SCREEN_MAIN, SCREEN_META, SCREEN_FFT, SCREEN_WAVE, SCREEN_SETTINGS, SCREEN_COUNT };
+
+enum SettingsRow { ROW_EQ_BASS, ROW_EQ_MID, ROW_EQ_TREBLE, ROW_EQ_PRESET,
+                    ROW_BYPASS, ROW_BASS_BOOST, ROW_CHANNEL_FLIP,
+                    ROW_COUNT };
+
+static constexpr const char* SETTINGS_LABELS[ROW_COUNT] = {
+    "EQ Bass", "EQ Mid", "EQ Treble", "EQ Preset",
+    "Stereo Bypass", "Bass Boost", "Channel Flip"
+};
+static constexpr const char* EQ_PRESET_NAMES[12] = {
+    "Flat", "Bass Boost", "Treble Boost", "Vocal", "Rock", "Pop",
+    "Jazz", "Classical", "Electronic", "Hip Hop", "Acoustic", "Loudness"
+};
 
 class OledDisplay {
 private:
@@ -13,9 +26,18 @@ private:
     bool m_playing = false;
     char m_peerName[32] = "";
     char m_codecName[16] = "";
+    
+    char m_title[64] = "";
+    char m_artist[64] = "";
+    char m_album[64] = "";
+    uint32_t m_positionMs;
+    uint32_t m_positionTs;
+    uint32_t m_durationMs;
+
     uint32_t m_sampleRate = 0;
     uint8_t m_bits = 0;
     uint32_t m_peerNameScrollStart = 0;
+    uint32_t m_metaScrollStart = 0;
 
     // --- GIF animation state ---
     FILE* m_gifFile = nullptr;
@@ -29,12 +51,19 @@ private:
     enum InputMode { MODE_BT, MODE_LINE };
     InputMode m_inputMode = MODE_BT;
 
+    int  m_settingsRow = 0;
+    bool m_settingsDetail = false;
+    int8_t  m_eqBass = 0, m_eqMid = 0, m_eqTreble = 0;
+    uint8_t m_eqPresetId = 0;
+    bool m_bassBoost = false, m_channelFlip = false, m_bypass = false;
+
 public:
     static OledDisplay& instance() {
         static OledDisplay d;
         return d;
     }
 
+    // Oled init
     void init() {
         u8g2_esp32_hal_t hal = U8G2_ESP32_HAL_DEFAULT;
         hal.bus.i2c.sda = (gpio_num_t)APP_DISPLAY_I2C_SDA_GPIO;
@@ -55,42 +84,80 @@ public:
         
     }
 
-    void toggleSettings() { m_settingsOpen = !m_settingsOpen; }
-
-    void setVolume(uint8_t v) { m_volume = v; };
-
-    void cycleScreen() { m_screenMode = (ScreenMode)((m_screenMode + 1) % SCREEN_COUNT); }
+    void setVolume(uint8_t v) { m_volume = v; m_volumeShowMs = nowMs(); };
+    
+    void cycleScreen() {
+        do {
+            m_screenMode = (ScreenMode)((m_screenMode + 1) % SCREEN_COUNT);
+        } while ((m_inputMode == MODE_LINE && m_screenMode == SCREEN_META) ||
+                 (m_inputMode == MODE_LINE && m_screenMode == SCREEN_SETTINGS));
+    }
     ScreenMode screenMode() const { return m_screenMode; }
 
     void setConnected(bool connected) {
         if (connected != m_connected) {
             m_connected = connected;
+            m_screenMode = SCREEN_MAIN;
         }
     }
+
     void setPlaying(bool playing) { m_playing = playing; }
+
     void setPeerName(const char* name) {
         strncpy(m_peerName, name, sizeof(m_peerName) - 1);
         m_peerName[sizeof(m_peerName) - 1] = '\0';
         m_peerNameScrollStart = nowMs();
     }
+
     void setCodecInfo(const char* codecName, uint32_t sampleRate, uint8_t bits) {
         strncpy(m_codecName, codecName, sizeof(m_codecName) - 1);
         m_codecName[sizeof(m_codecName) - 1] = '\0';
         m_sampleRate = sampleRate;
         m_bits = bits;
     }
+
     void decreaseWaveGain() { m_waveGain -= 0.5f; if (m_waveGain < 1.0f) m_waveGain = 3.0f; }
     void increaseWaveGain() { m_waveGain += 0.5f; if (m_waveGain > 3.0f) m_waveGain = 1.0f; }
 
+    // Animation bottom text
     void setBottomText(const char* text) { 
         strncpy(m_bottomText, text, sizeof(m_bottomText) - 1);
         ESP_LOGI("OledDisplay", "bottomText: %s", text);
     }
+
+    // Internal input mode set from main.cpp
     void setInputMode(int mode) {
         if (mode == 0) m_inputMode = MODE_BT;
         else if (mode == 1) m_inputMode = MODE_LINE;
     }
 
+    void setTrackInfo(const char* title, const char* artist, const char* album) {
+        strncpy(m_title, title, sizeof(m_title) - 1);
+        strncpy(m_artist, artist, sizeof(m_artist) - 1);
+        strncpy(m_album, album, sizeof(m_album) - 1);
+        m_metaScrollStart = nowMs();
+        ESP_LOGI("OledDisplay", "Track info updated: Title: %s, Artist: %s, Album: %s", m_title, m_artist, m_album);
+    }
+    void setDuration(uint32_t durationMs) { m_durationMs = durationMs; }
+    void setPosition(uint32_t positionMs) { m_positionMs = positionMs; m_positionTs = nowMs(); }
+
+    // Settings
+    void setEqValues(int8_t bass, int8_t mid, int8_t treble) {
+        m_eqBass = bass; m_eqMid = mid; m_eqTreble = treble;
+    }
+    void setEqPreset(uint8_t id) { m_eqPresetId = id; }
+    void setToggleStates(bool bassBoost, bool chFlip, bool bypass) {
+        m_bassBoost = bassBoost; m_channelFlip = chFlip; m_bypass = bypass;
+    }
+    int  settingsRow() const { return m_settingsRow; }
+    bool settingsDetailOpen() const { return m_settingsDetail; }
+    void settingsMoveRow(int delta) {
+        do {
+            m_settingsRow = (m_settingsRow + delta + ROW_COUNT) % ROW_COUNT;
+        } while (!rowVisible(m_settingsRow));
+    }
+    void toggleSettingsDetail() { m_settingsDetail = !m_settingsDetail; }
+    void closeSettingsDetail() { m_settingsDetail = false; }
 
 private:
     static constexpr int FFT_SAMPLES   = 1024;
@@ -115,17 +182,20 @@ private:
 
     static void taskEntry(void *arg) { static_cast<OledDisplay*>(arg)->task(); }
 
-    bool m_settingsOpen = false;
-    uint32_t m_volumeStartMs;
+    uint32_t m_volumeShowMs = 0;
     uint8_t m_volume = 0;
     uint8_t lastVolume = 0;
 
     InputMode lastInputMode = MODE_BT;
 
     void task() {
+        TickType_t lastWakeTime = xTaskGetTickCount();
         gifOpen("/spiffs/waiting.raw", 8);
+
+        uint32_t frameCount = 0;
+        uint32_t fpsStartMs = nowMs();
+
         for (;;) {
-            uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
             u8g2_ClearBuffer(&m_u8g2);
             switch (m_screenMode) {
                 case SCREEN_FFT:  drawFft(); break;
@@ -149,21 +219,38 @@ private:
                         u8g2_DrawUTF8(&m_u8g2, (128 - u8g2_GetUTF8Width(&m_u8g2, m_bottomText)) / 2, 60, m_bottomText);
                     }
                     break;
-                default:
-                /* SCREEN_MAIN wired up in the AVRCP step */ 
-                break;
+                case SCREEN_META: drawMetaInfo(); break;
+                case SCREEN_SETTINGS: drawSettings(); break;
+                default: break;
             }
-
-            if (m_volume != lastVolume) {
-                m_volumeStartMs = now;
-                lastVolume = m_volume;
-            }
-            if (now - m_volumeStartMs <= 3000 && now > 5000) drawVolume();
+            // Show volume with timeout
+            if (nowMs() - m_volumeShowMs <= 3000 && nowMs() > 3000) drawVolume();
 
             u8g2_SendBuffer(&m_u8g2);
-            // vTaskDelay(pdMS_TO_TICKS(20));
-            vTaskDelay(1);
+            frameCount++;
+
+            // Log FPS every second
+            // uint32_t now = nowMs();
+            // if (now - fpsStartMs >= 1000) {
+            //     ESP_LOGI("OledDisplay", "FPS: %u", frameCount);
+            //     frameCount = 0;
+            //     fpsStartMs = now;
+            // }
+
+            // vTaskDelay(1);
+            vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(25));  // ~40 FPS
         }
+    }
+
+    void formatTime(uint32_t ms, char *buf) {
+        uint32_t s = ms / 1000;
+        uint32_t h = s / 3600;
+        uint32_t m = (s % 3600) / 60;
+        uint32_t sec = s % 60;
+        if (h > 0)
+            snprintf(buf, 10, "%u:%02u:%02u", h, m, sec);
+        else
+            snprintf(buf, 10, "%u:%02u", m, sec);
     }
 
     void gifOpen(const char* path, uint32_t fps) {
@@ -190,12 +277,13 @@ private:
 
     void drawMainInfo() {
         u8g2_SetFont(&m_u8g2, u8g2_font_tinyunicode_tr);
-        u8g2_DrawUTF8(&m_u8g2, 0, 10, "Bluetooth Mode");
+        u8g2_DrawUTF8(&m_u8g2, 0, 5, "Bluetooth Mode");
+        u8g2_DrawUTF8(&m_u8g2, 0, 16, "Connected Device:");
         u8g2_SetFont(&m_u8g2, u8g2_font_open_iconic_embedded_2x_t);
         u8g2_DrawGlyph(&m_u8g2, 112, 16, 74); // Bluetooth logo
 
         u8g2_SetFont(&m_u8g2, u8g2_font_originalsans_tr);
-        const char* name = (m_peerName[0]) ? m_peerName : "Connected Device";
+        const char* name = (m_peerName[0]) ? m_peerName : "Unknown Device";
         int nameW = u8g2_GetUTF8Width(&m_u8g2, name);
         drawScrollUTF8(name, 28, m_peerNameScrollStart, nameW);
 
@@ -205,7 +293,7 @@ private:
         snprintf(info1, sizeof(info1), "Codec: %s", m_codecName);
         u8g2_DrawUTF8(&m_u8g2, 0, 42, info1);
         char info2[24];
-        snprintf(info2, sizeof(info2), "%.1fkHz/%dbit", m_sampleRate / 1000.0f, m_bits);
+        snprintf(info2, sizeof(info2), "%dbit / %.1fkHz", m_bits, m_sampleRate / 1000.0f);
         u8g2_DrawUTF8(&m_u8g2, 0, 50, info2);
 
         // Show "Hi-Res Audio" logo for LDAC and aptX HD
@@ -230,7 +318,43 @@ private:
         u8g2_DrawUTF8(&m_u8g2, 100, 62, "M"); // mode
     }
 
-    void drawVolume(){
+    void drawMetaInfo() {
+        // layout: y=14 title | y=30 artist | y=46 album
+        //         y=49-56 seekbar | y=63 time & peer name
+        u8g2_SetFont(&m_u8g2, u8g2_font_unifont_t_japanese3);
+        drawScrollUTF8(m_title[0]  ? m_title  : "No Information", 14, m_metaScrollStart, u8g2_GetUTF8Width(&m_u8g2, m_title[0]  ? m_title  : "No Information"));
+        drawScrollUTF8(m_artist[0] ? m_artist : "",               30, m_metaScrollStart, u8g2_GetUTF8Width(&m_u8g2, m_artist[0] ? m_artist : ""));
+        drawScrollUTF8(m_album[0]  ? m_album  : "",               46, m_metaScrollStart, u8g2_GetUTF8Width(&m_u8g2, m_album[0]  ? m_album  : ""));
+        
+        // Interpolate position
+        uint32_t pos = m_positionMs;
+        if (m_playing && m_positionTs > 0)
+            pos += (nowMs() - m_positionTs);
+        if (m_durationMs > 0 && pos > m_durationMs)
+            pos = m_durationMs;
+
+        // Seekbar
+        u8g2_DrawFrame(&m_u8g2, 0, 49, 128, 6);
+        if (m_durationMs > 0) {
+            int fill = (int)(128ULL * pos / m_durationMs);
+            if (fill > 0) u8g2_DrawBox(&m_u8g2, 0, 49, fill, 6);
+        }
+
+        // Time
+        char pos_str[10], dur_str[10];
+        formatTime(pos, pos_str);
+        formatTime(m_durationMs, dur_str);
+        u8g2_SetFont(&m_u8g2, u8g2_font_5x7_tf);
+        u8g2_DrawStr(&m_u8g2, 0, 63, pos_str);
+        u8g2_DrawStr(&m_u8g2, 128 - u8g2_GetStrWidth(&m_u8g2, dur_str), 63, dur_str);
+
+        // play/pause icon 
+        u8g2_SetFont(&m_u8g2, u8g2_font_open_iconic_play_1x_t);
+        if (m_playing) u8g2_DrawGlyph(&m_u8g2, 60, 63, 0x45); // play
+        else u8g2_DrawGlyph(&m_u8g2, 60, 63, 0x44); // pause
+    }
+
+    void drawVolume() {
         u8g2_SetDrawColor(&m_u8g2, 0);
         u8g2_DrawBox(&m_u8g2, 0, 46, 128, 18);
         u8g2_SetDrawColor(&m_u8g2, 1);
@@ -264,8 +388,8 @@ private:
     }
 
     void drawFft() {
-        u8g2_SetFont(&m_u8g2, u8g2_font_5x8_tr);
-        u8g2_DrawStr(&m_u8g2, 0, 7, "FFT");
+        u8g2_SetFont(&m_u8g2, u8g2_font_tinyunicode_tr);
+        u8g2_DrawStr(&m_u8g2, 0, 5, "FFT");
         int16_t snap[FFT_SAMPLES];
         AudioTap::instance().snapshot(snap, FFT_SAMPLES, AudioTap::instance().pos() - FFT_SAMPLES);
         for (int i = 0; i < FFT_SAMPLES; i++) {
@@ -297,10 +421,13 @@ private:
             }
         }
 
+        // more gate to bar 0 because too noisy (hardware limitation)
+        barMag[0] = (m_inputMode == MODE_LINE && barMag[0] < -46.0f) ? DB_FLOOR : barMag[0]; 
+
         const int BAR_AREA = 54;
         const int BAR_WIDTH = 128 / NUM_BARS;
         const int START_X = (128 - NUM_BARS * BAR_WIDTH) / 2;
-        const int BAR_DECAY = 4, PEAK_DECAY = 2;
+        const int BAR_DECAY = 2, PEAK_DECAY = 1;
         const uint32_t PEAK_HOLD_MS = 750;
         uint32_t now = nowMs();
 
@@ -325,8 +452,8 @@ private:
         char wave_str[16];
         if (m_waveGain > 1.0f) snprintf(wave_str, sizeof(wave_str), "WAVE x%.1f", m_waveGain);
         else snprintf (wave_str, sizeof(wave_str), "WAVE");
-        u8g2_SetFont(&m_u8g2, u8g2_font_5x8_tr);
-        u8g2_DrawStr(&m_u8g2, 0, 7, wave_str);
+        u8g2_SetFont(&m_u8g2, u8g2_font_tinyunicode_tr);
+        u8g2_DrawStr(&m_u8g2, 0, 5, wave_str);
 
         int16_t snap[128];
         int step = (int)((AudioTap::BUF_LEN / 128) * WAVE_ZOOM);
@@ -346,5 +473,115 @@ private:
             y = iclamp(y, TOP, BOTTOM);
             u8g2_DrawPixel(&m_u8g2, x, y);
         }
+    }
+
+    bool rowVisible(int row) const {
+        if ((row == ROW_BASS_BOOST || row == ROW_CHANNEL_FLIP) && m_bypass) return false;
+        return true;
+    }
+
+    const char* presetName(uint8_t id) const {
+        return (id < 12) ? EQ_PRESET_NAMES[id] : "Custom";
+    }
+
+    bool rowIsBool(int row) const {
+        return row == ROW_BYPASS || row == ROW_BASS_BOOST || row == ROW_CHANNEL_FLIP;
+    }
+    bool rowBoolValue(int row) const {
+        switch (row) {
+            case ROW_BASS_BOOST:    return m_bassBoost;
+            case ROW_CHANNEL_FLIP:  return m_channelFlip;
+            case ROW_BYPASS:        return m_bypass;
+            default: return false;
+        }
+    }
+
+    void drawSettings() {
+        if (m_settingsDetail) drawSettingsDetail();
+        else drawSettingsMenu();
+    }
+
+    void drawSettingsMenu() {
+        u8g2_SetFont(&m_u8g2, u8g2_font_tinyunicode_tr);
+        u8g2_DrawUTF8(&m_u8g2, 0, 5, "Settings");
+
+        int visible[ROW_COUNT];
+        int visibleCount = 0;
+        int selectedIdx = 0;
+        for (int r = 0; r < ROW_COUNT; r++) {
+            if (!rowVisible(r)) continue;
+            if (r == m_settingsRow) selectedIdx = visibleCount;
+            visible[visibleCount++] = r;
+        }
+
+        const int rowH = 9, startY = 16, visibleRows = 6;
+        int firstVisible = selectedIdx - visibleRows / 2;
+        if (firstVisible < 0) firstVisible = 0;
+        if (firstVisible > visibleCount - visibleRows) firstVisible = visibleCount - visibleRows;
+        if (firstVisible < 0) firstVisible = 0;
+
+        for (int i = 0; i < visibleRows && firstVisible + i < visibleCount; i++) {
+            int row = visible[firstVisible + i];
+            int y = startY + i * rowH;
+            if (row == m_settingsRow) {
+                u8g2_DrawBox(&m_u8g2, 0, y - 7, 128, rowH);
+                u8g2_SetDrawColor(&m_u8g2, 0);
+            }
+            u8g2_DrawUTF8(&m_u8g2, 2, y, SETTINGS_LABELS[row]);
+
+            char val[16] = {};
+            if (row == ROW_EQ_BASS)        snprintf(val, sizeof(val), "%+d", m_eqBass);
+            else if (row == ROW_EQ_MID)    snprintf(val, sizeof(val), "%+d", m_eqMid);
+            else if (row == ROW_EQ_TREBLE) snprintf(val, sizeof(val), "%+d", m_eqTreble);
+            else if (row == ROW_EQ_PRESET) snprintf(val, sizeof(val), "%s", presetName(m_eqPresetId));
+            else if (rowIsBool(row))       snprintf(val, sizeof(val), "%s", rowBoolValue(row) ? "ON" : "OFF");
+
+            int w = u8g2_GetUTF8Width(&m_u8g2, val);
+            u8g2_DrawUTF8(&m_u8g2, 126 - w, y, val);
+
+            if (row == m_settingsRow) u8g2_SetDrawColor(&m_u8g2, 1);
+        }
+    }
+
+    void drawSettingsDetail() {
+        u8g2_SetFont(&m_u8g2, u8g2_font_tinyunicode_tr);
+        u8g2_DrawUTF8(&m_u8g2, 0, 5, SETTINGS_LABELS[m_settingsRow]);
+
+        if (m_settingsRow == ROW_EQ_PRESET) {
+            int current = (m_eqPresetId < 12) ? m_eqPresetId : 0;
+            const int rowH = 9, startY = 16, visibleRows = 6;
+            int firstVisible = current - visibleRows / 2;
+            if (firstVisible < 0) firstVisible = 0;
+            if (firstVisible > 12 - visibleRows) firstVisible = 12 - visibleRows;
+
+            for (int i = 0; i < visibleRows; i++) {
+                int id = firstVisible + i;
+                int y = startY + i * rowH;
+                bool selected = (id == m_eqPresetId);
+                if (selected) {
+                    u8g2_DrawBox(&m_u8g2, 10, y - 8, 108, rowH);
+                    u8g2_SetDrawColor(&m_u8g2, 0);
+                }
+                u8g2_DrawUTF8(&m_u8g2, 14, y, EQ_PRESET_NAMES[id]);
+                if (selected) u8g2_SetDrawColor(&m_u8g2, 1);
+            }
+            return;
+        }
+
+        int8_t value = (m_settingsRow == ROW_EQ_BASS) ? m_eqBass
+                      : (m_settingsRow == ROW_EQ_MID)  ? m_eqMid : m_eqTreble;
+
+        u8g2_SetFont(&m_u8g2, u8g2_font_originalsans_tr);
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%+d dB", value);
+        u8g2_DrawUTF8(&m_u8g2, (128 - u8g2_GetUTF8Width(&m_u8g2, buf)) / 2, 34, buf);
+
+        const int barX = 14, barW = 100, barY = 44;
+        u8g2_DrawFrame(&m_u8g2, barX, barY, barW, 8);
+        int mid = barX + barW / 2;
+        int fillW = (barW / 2) * value / 12;
+        if (fillW >= 0) u8g2_DrawBox(&m_u8g2, mid, barY, fillW, 8);
+        else u8g2_DrawBox(&m_u8g2, mid + fillW, barY, -fillW, 8);
+        u8g2_DrawVLine(&m_u8g2, mid, barY, 8);
     }
 };

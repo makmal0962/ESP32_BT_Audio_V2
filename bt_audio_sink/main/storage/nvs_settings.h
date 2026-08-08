@@ -233,6 +233,23 @@ public:
         return true;
     }
 
+    uint8_t loadEqPreset() {
+        nvs_handle_t h;
+        if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return 255;   // default: Custom
+        uint8_t id = 255;
+        nvs_get_u8(h, "eq_preset", &id);
+        nvs_close(h);
+        return id;
+    }
+    bool saveEqPreset(uint8_t id) {
+        nvs_handle_t h;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+        nvs_set_u8(h, "eq_preset", id);
+        nvs_commit(h);
+        nvs_close(h);
+        return true;
+    }
+
 private:
     static constexpr const char* TAG = "NVS";
     Settings m_settings;

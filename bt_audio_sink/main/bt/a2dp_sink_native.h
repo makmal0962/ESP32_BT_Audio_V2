@@ -29,6 +29,11 @@ using a2dp_audio_state_cb = void (*)(esp_a2d_audio_state_t state, void *user);
 using a2dp_codec_config_cb = void (*)(uint32_t rate, uint8_t bps, uint8_t channels);
 using a2dp_volumechange_cb = void (*)(int volume);
 using a2dp_data_received_cb = void (*)();
+using a2dp_metadata_cb   = void (*)(const char* title, const char* artist, const char* album);
+using a2dp_playstatus_cb = void (*)(esp_avrc_playback_stat_t status);
+using a2dp_peername_cb   = void (*)(const char* name);
+using a2dp_position_cb = void (*)(uint32_t positionMs);
+using a2dp_duration_cb = void (*)(uint32_t durationMs);
 
 enum ReconnectStatus { NoReconnect, AutoReconnect, IsReconnecting };
 
@@ -58,6 +63,11 @@ public:
     // AVRCP
     void set_avrc_rn_volumechange(a2dp_volumechange_cb callback);
     void set_avrc_rn_volumechange_completed(a2dp_volumechange_cb callback);
+    void set_on_track_metadata_changed(a2dp_metadata_cb cb) { metadata_cb = cb; }
+    void set_on_play_status_changed(a2dp_playstatus_cb cb) { playstatus_cb = cb; }
+    void set_on_peer_name_resolved(a2dp_peername_cb cb) { peername_cb = cb; }
+    void set_on_position_changed(a2dp_position_cb cb) { position_cb = cb; }
+    void set_on_duration_changed(a2dp_duration_cb cb) { duration_cb = cb; }
 
     // Controls
     void play();
@@ -90,6 +100,14 @@ public:
     // Get vendor codec name
     const char* get_vendor_codec_name() const { return m_vendorCodecName; }
 
+    // Get AVRCP metadata
+    const char* get_track_title() const { return m_trackTitle; }
+    const char* get_track_artist() const { return m_trackArtist; }
+    const char* get_track_album() const { return m_trackAlbum; }
+    const char* get_peer_name() const { return m_peerName; }
+    esp_avrc_playback_stat_t get_play_status() const { return m_playStatus; }
+
+
 private:
     static constexpr const char* TAG = "NativeA2DP";
     static constexpr int AUTOCONNECT_TRY_NUM = 3;
@@ -121,6 +139,14 @@ private:
     // AVRCP peer caps
     esp_avrc_rn_evt_cap_mask_t s_avrc_peer_rn_cap = {0};
 
+    // AVRCP metadata
+    char m_trackTitle[64]  = "";
+    char m_trackArtist[64] = "";
+    char m_trackAlbum[64]  = "";
+    char m_peerName[ESP_BT_GAP_MAX_BDNAME_LEN + 1] = "";
+    
+    esp_avrc_playback_stat_t m_playStatus = ESP_AVRC_PLAYBACK_STOPPED;
+
     // Callbacks
     a2dp_stream_reader_cb stream_reader = nullptr;
     a2dp_stream_reader_cb raw_stream_reader = nullptr;
@@ -130,6 +156,11 @@ private:
     a2dp_codec_config_cb codec_config_cb = nullptr;
     a2dp_volumechange_cb volumechange_cb = nullptr;
     a2dp_volumechange_cb volumechange_completed_cb = nullptr;
+    a2dp_metadata_cb   metadata_cb   = nullptr;
+    a2dp_playstatus_cb playstatus_cb = nullptr;
+    a2dp_peername_cb   peername_cb   = nullptr;
+    a2dp_position_cb position_cb = nullptr;
+    a2dp_duration_cb duration_cb = nullptr;
 
     // App task dispatch (work queue)
     QueueHandle_t app_task_queue = nullptr;

@@ -16,6 +16,7 @@ set(COMPONENT_PRIV_REQUIRES
     u8g2 
     u8g2_hal
     mbedtls
+    esp_adc
 )
 
 set(COMPONENT_SRCS 

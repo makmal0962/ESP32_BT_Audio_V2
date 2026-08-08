@@ -36,7 +36,8 @@
  #include "audio/overlay_mixer.h"
  #include "ble/ble_unified.h"
  #include "ota/idf_update.h"
- 
+ #include "audio/line_input_capture.h"
+
  // SPIFFS for sound storage
  #include "esp_spiffs.h"
  #include <sys/stat.h>
@@ -83,7 +84,15 @@
  static volatile bool     g_otaActive = false;
  static volatile int64_t  g_otaCheckPassedTime = 0;  // Timestamp when CHECK passed (0 = not passed)
  static volatile bool     g_codecReconfiguring = false;
+ static int8_t            g_eqBass = 0;
+ static int8_t            g_eqMid = 0;
+ static int8_t            g_eqTreble = 0;
  static TaskHandle_t      audioTaskHandle = nullptr;
+ static bool              g_bassBoost = false;
+ static bool              g_channelFlip = false;
+ static bool              g_bypass = false;
+ static constexpr uint8_t EQ_PRESET_CUSTOM = 255;
+ static uint8_t           g_eqPresetId = EQ_PRESET_CUSTOM;
  
  struct CodecConfigRequest {
      uint32_t rate;
@@ -95,14 +104,18 @@
  
  // Pairing mode coordination flag - prevents disconnect callback from clearing pairing mode
  static volatile bool     g_pairingModeActive = false;  // True while in pairing mode (discoverable)
+
+ // check for first connection after boot
+ static volatile bool     g_firstConnectionAfterBoot = true;
  
  // Codec switch detection - to suppress connected sound during rapid codec changes
  static volatile int64_t  g_lastDisconnectTime = 0;     // Timestamp of last disconnect (esp_timer_get_time)
- static const int64_t     CODEC_SWITCH_TIMEOUT_US = 5000000;  // 5 seconds - if reconnect within this, skip connected sound
+ static const int64_t     CODEC_SWITCH_TIMEOUT_US = 3000000;  // 3 seconds - if reconnect within this, skip connected sound
  
  // Connected sound delay - wait for codec to stabilize before playing
  static volatile int64_t  g_lastCodecConfigTime = 0;    // Timestamp of last codec config
  static volatile bool     g_connectedSoundPending = false;  // True if waiting to play connected sound
+ static volatile bool     g_pairingPromptPending = false; // True after disconnect timeout expires; play pairing sound once
  static const int64_t     CODEC_STABLE_DELAY_US = 400000;   // 400ms - wait this long after last codec config
  
  // Connection timestamp - to ignore initial volume report from phone
@@ -112,7 +125,7 @@
  
  // Max volume sound rate limiting - prevent crash from spamming
  static volatile int64_t  g_lastMaxVolumeSound = 0;     // Timestamp of last max volume sound
- static const int64_t     MAX_VOLUME_SOUND_COOLDOWN_US = 500000;  // 500 ms cooldown between plays
+ static const int64_t     MAX_VOLUME_SOUND_COOLDOWN_US = 250000;  // 250 ms cooldown between plays
  
  // Max-volume overlay now returns seamlessly through OverlayMixer's duck ramp.
  // No same-rate I2S recovery/reset is used here; the previous post-effect
@@ -152,9 +165,11 @@
      g_dsp.setChannelFlip(b & 0x02);
      g_dsp.setBypass(b & 0x04);
      g_settings.saveControl(b & 0x01, b & 0x02, b & 0x04);
+     #ifdef CONFIG_BT_BLE_ENABLED
      if (notifyBle) {
          g_ble.updateControl(getControlByte());
      }
+     #endif
  }
  
  // Heap logging helper for init stages
@@ -171,10 +186,12 @@
  
  static void applyEq(int8_t bass, int8_t mid, int8_t treble, bool notifyBle = true) {
      g_dsp.setEQ(bass, mid, treble, g_sampleRate);
-     g_settings.saveEQ(bass, mid, treble);
+    //  g_settings.saveEQ(bass, mid, treble);
+     #ifdef CONFIG_BT_BLE_ENABLED
      if (notifyBle) {
          g_ble.updateEq(bass, mid, treble);
      }
+     #endif
      
      // Sync encoder controller if encoders are enabled
      #ifdef CONFIG_ENCODER_ENABLE
@@ -341,10 +358,11 @@ static void doVolumeSet(uint8_t volume) {
 }
 
 static void doPlayPause() {
-    if (g_isPlaying) g_a2dp.pause();
+    bool is_playing = g_a2dp.get_play_status() == ESP_AVRC_PLAYBACK_PLAYING;
+    if (is_playing) g_a2dp.pause();
     else g_a2dp.play();
-    ESP_LOGI(TAG, "Transport: %s", g_isPlaying ? "pause" : "play");
-    g_isPlaying = !g_isPlaying;
+    ESP_LOGI(TAG, "Transport: %s", is_playing ? "pause" : "play");
+    
 }
 
 static void doNextTrack() {
@@ -368,6 +386,7 @@ static void doPairingMode() {
         ESP_LOGI(TAG, "Disconnecting current device to enter pairing mode...");
         g_a2dp.disconnect();
         vTaskDelay(pdMS_TO_TICKS(500));  // Wait for disconnect
+        
     }
     else {
         ESP_LOGI(TAG, "Nothing to disconnect. skipping...");
@@ -387,6 +406,7 @@ static void doPairingMode() {
     // Play pairing sound (exclusive mode - no A2DP during pairing anyway)
     // Use actual I2S sample rate to ensure proper resampling
     g_sound.play(SOUND_PAIRING, g_i2s.getSampleRate(), SOUND_MODE_EXCLUSIVE);
+    OledDisplay::instance().setBottomText("Waiting for connection . . .");
     
     // Start pairing mode LED animation (slow blue pulsing)
     #ifdef CONFIG_LED_MATRIX_ENABLE
@@ -1669,7 +1689,6 @@ static void doPairingMode() {
  #endif
  
      while (true) {
-         if (g_inputMode == MODE_LINE) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
          ulTaskNotifyTake(pdTRUE, waitTicks);
         
          uint32_t chunks = 0;
@@ -1719,6 +1738,7 @@ static void doPairingMode() {
          
          // Cancel any pending connected sound
          g_connectedSoundPending = false;
+         g_pairingPromptPending = false;
          
          ESP_LOGW(TAG, "A2DP disconnected - waiting for phone to reconnect with new codec...");
          g_pipeline.clear();
@@ -1729,12 +1749,10 @@ static void doPairingMode() {
          if (!g_pairingModeActive) {
              g_sampleRate = APP_I2S_DEFAULT_SAMPLE_RATE;  // Reset sample rate for sound effects
 
-             if (g_inputMode == MODE_BT){
-                g_a2dp.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
-                ESP_LOGI(TAG, "Discoverability enabled after disconnect");
-                OledDisplay::instance().setBottomText("Waiting for connection . . .");
-                // g_sound.play(SOUND_PAIRING, g_i2s.getSampleRate(), SOUND_MODE_EXCLUSIVE);
-             }
+             g_a2dp.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
+             ESP_LOGI(TAG, "Discoverability enabled after disconnect");
+            //  OledDisplay::instance().setBottomText("Waiting for connection . . .");
+             // g_sound.play(SOUND_PAIRING, g_i2s.getSampleRate(), SOUND_MODE_EXCLUSIVE);
              // Stop pairing animation if running (only if not intentionally in pairing mode)
              #ifdef CONFIG_LED_MATRIX_ENABLE
              LedController::getInstance().setPairingMode(false);
@@ -1746,11 +1764,19 @@ static void doPairingMode() {
          OledDisplay::instance().setBottomText("Loading . . .");
          ESP_LOGI(TAG, "A2DP connected - codec should already be configured");
          
+         // Clear any pending disconnect prompt state
+         g_pairingPromptPending = false;
+         
          // Mark as connected
          g_a2dpConnected = true;
-         
+
+         // Mark the first connection after boot
+         g_firstConnectionAfterBoot = false;
+
+         #ifdef CONFIG_BT_BLE_ENABLED
          // Restart BLE advertising so the app can still connect via BLE while A2DP is active
          g_ble.restartAdvertising();
+         #endif
          
          // Record connection time - used to ignore initial volume report from phone
          g_lastConnectTime = esp_timer_get_time();
@@ -1786,8 +1812,10 @@ static void doPairingMode() {
              LedController::getInstance().setPairingMode(false);
          }
          #endif
+         #ifdef CONFIG_BT_BLE_ENABLED
          // Restart BLE advertising so the app can connect while A2DP is active
          g_ble.restartAdvertising();
+         #endif
      }
  }
  
@@ -1800,8 +1828,7 @@ static void doPairingMode() {
      
      ESP_LOGI(TAG, ">>> A2DP Audio State: %s", stateStr);
 
-     OledDisplay::instance().setPlaying(state == ESP_A2D_AUDIO_STATE_STARTED);
-    //  g_isPlaying = (state == ESP_A2D_AUDIO_STATE_STARTED);   // also fixes doPlayPause's state tracking
+     g_isPlaying = (state == ESP_A2D_AUDIO_STATE_STARTED);   // also fixes doPlayPause's state tracking
 
      
      if (state == ESP_A2D_AUDIO_STATE_SUSPEND) {
@@ -1809,8 +1836,10 @@ static void doPairingMode() {
          g_pipeline.clear();
          g_pipeline.clear();
      } else if (state == ESP_A2D_AUDIO_STATE_STARTED) {
+         #ifdef CONFIG_BT_BLE_ENABLED
          // Restart BLE advertising so app can connect while audio is playing
          g_ble.restartAdvertising();
+         #endif
      }
  }
 
@@ -1819,12 +1848,18 @@ static void doPairingMode() {
  // -----------------------------------------------------------
 
 static void switchToLineMode() {
+    OledDisplay::instance().setConnected(false);
+    OledDisplay::instance().setBottomText("Loading . . .");
     g_settings.saveInputMode(1);
+    vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
 }
 
 static void switchToBTMode() {
+    OledDisplay::instance().setInputMode(MODE_BT);
+    OledDisplay::instance().setBottomText("Loading . . .");
     g_settings.saveInputMode(0);
+    vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
 }
 
@@ -1845,6 +1880,56 @@ static void toggleLineInMute() {
         OledDisplay::instance().setBottomText("Line Input Mode");
     }
 }
+
+// Screen settings
+static int iclamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static void adjustEqSetting(int delta) {
+    int row = OledDisplay::instance().settingsRow();
+    switch (row) {
+        case ROW_EQ_BASS:
+            g_eqBass = (int8_t)iclamp(g_eqBass + delta, -12, 12);
+            g_eqPresetId = EQ_PRESET_CUSTOM;
+            applyEq(g_eqBass, g_eqMid, g_eqTreble, true);
+            break;
+        case ROW_EQ_MID:
+            g_eqMid = (int8_t)iclamp(g_eqMid + delta, -12, 12);
+            g_eqPresetId = EQ_PRESET_CUSTOM;
+            applyEq(g_eqBass, g_eqMid, g_eqTreble, true);
+            break;
+        case ROW_EQ_TREBLE:
+            g_eqTreble = (int8_t)iclamp(g_eqTreble + delta, -12, 12);
+            g_eqPresetId = EQ_PRESET_CUSTOM;
+            applyEq(g_eqBass, g_eqMid, g_eqTreble, true);
+            break;
+        case ROW_EQ_PRESET: {
+            g_eqPresetId = (uint8_t)((g_eqPresetId == EQ_PRESET_CUSTOM ? 0 : g_eqPresetId) + delta + 12) % 12;
+            g_eqBass = EQ_PRESETS[g_eqPresetId][0];
+            g_eqMid = EQ_PRESETS[g_eqPresetId][1];
+            g_eqTreble = EQ_PRESETS[g_eqPresetId][2];
+            applyEq(g_eqBass, g_eqMid, g_eqTreble, true);
+            break;
+        }
+    }
+    OledDisplay::instance().setEqValues(g_eqBass, g_eqMid, g_eqTreble);
+    OledDisplay::instance().setEqPreset(g_eqPresetId);
+}
+
+static void toggleBooleanSetting() {
+    int row = OledDisplay::instance().settingsRow();
+    uint8_t b = getControlByte();
+    switch (row) {
+        case ROW_BASS_BOOST:   b ^= 0x01; break;
+        case ROW_CHANNEL_FLIP: b ^= 0x02; break;
+        case ROW_BYPASS:       b ^= 0x04; break;
+        default: return;
+    }
+    applyControlByte(b, true);
+    OledDisplay::instance().setToggleStates(g_dsp.isBassBoostEnabled(), g_dsp.isChannelFlipEnabled(), g_dsp.isBypassEnabled());
+    // if (row == ROW_BYPASS && !g_dsp.isBypassEnabled()) {
+    //     OledDisplay::instance().settingsMoveRow(1);   // bounce off if landed on a now-hidden row
+    // }
+}
  
  // -----------------------------------------------------------
  // Button handling task
@@ -1864,7 +1949,6 @@ static void toggleLineInMute() {
 
     const uint32_t HOLD_THRESHOLD_MS = 500;
     const uint32_t REPEAT_INTERVAL_MS = 150;
-    const uint8_t  VOLUME_STEP = 4;
 
      
      // LED effect button (can be separate or shared with button 2)
@@ -1917,19 +2001,47 @@ static void toggleLineInMute() {
              }
          }
 
+         // Once the codec-switch grace period has passed and the phone is still not back,
+         // show the waiting prompt and play the pairing sound once to guide the user.
+         if (!g_a2dpConnected && !g_pairingModeActive && g_lastDisconnectTime > 0 && !g_pairingPromptPending && !g_firstConnectionAfterBoot) {
+             int64_t timeSinceDisconnect = esp_timer_get_time() - g_lastDisconnectTime;
+             if (timeSinceDisconnect >= CODEC_SWITCH_TIMEOUT_US) {
+                 g_pairingPromptPending = true;
+                 OledDisplay::instance().setBottomText("Waiting for connection . . .");
+                 ESP_LOGI(TAG, "Connection lost for %lld ms - playing pairing prompt",
+                          timeSinceDisconnect / 1000);
+                 g_sound.play(SOUND_PAIRING, g_i2s.getSampleRate(), SOUND_MODE_EXCLUSIVE);
+             }
+         }
+
         bool play_btn = (gpio_get_level((gpio_num_t)APP_BTN_PLAY_GPIO) == 0);
         if (play_btn && !play_held) {
             play_press_ms = now; play_held = true; play_long_fired = false;
         } else if (play_btn && play_held) {
             if (!play_long_fired && now - play_press_ms >= 3000) {
                 play_long_fired = true;
+                // play button held
                 if (g_inputMode == MODE_BT) doPairingMode();
             }
         } else if (!play_btn && play_held) {
             play_held = false;
             if (!play_long_fired && now - play_press_ms >= DEBOUNCE_MS) {
-                if (g_inputMode == MODE_BT) doPlayPause();
-                else if (g_inputMode == MODE_LINE) toggleLineInMute();
+                // play button short press
+                if (OledDisplay::instance().screenMode() == SCREEN_SETTINGS) {
+                    if (OledDisplay::instance().settingsDetailOpen()) {
+                        g_settings.saveEQ(g_eqBass, g_eqMid, g_eqTreble);
+                        g_settings.saveEqPreset(g_eqPresetId);
+                        OledDisplay::instance().closeSettingsDetail();
+                    } else if (OledDisplay::instance().settingsRow() <= ROW_EQ_PRESET) {
+                        OledDisplay::instance().toggleSettingsDetail();
+                    } else {
+                        toggleBooleanSetting();
+                    }
+                } else if (g_inputMode == MODE_LINE) {
+                    toggleLineInMute();
+                } else {
+                    doPlayPause();
+                }
             }
             play_long_fired = false;
         }
@@ -1940,12 +2052,15 @@ static void toggleLineInMute() {
         } else if (mode_btn && mode_held) {
             if (!mode_long_fired && now - mode_press_ms >= 1000) {
                 mode_long_fired = true;
+                // mode button held
                 toggleInputMode();
             }
         } else if (!mode_btn && mode_held) {
             mode_held = false;
-            if (!mode_long_fired && now - mode_press_ms >= DEBOUNCE_MS)
+            if (!mode_long_fired && now - mode_press_ms >= DEBOUNCE_MS) {
+                // mode button short press
                 OledDisplay::instance().cycleScreen();
+            }
             mode_long_fired = false;
         }
 
@@ -1956,16 +2071,25 @@ static void toggleLineInMute() {
         } else if (prev_btn && prev_held) {
             if (now - prev_press_ms >= HOLD_THRESHOLD_MS && now - prev_last_repeat_ms >= REPEAT_INTERVAL_MS) {
                 prev_long_fired = true;
-                if (g_inputMode == MODE_BT) g_a2dp.volume_down();
+                // prev button held and repeating
+                if (OledDisplay::instance().screenMode() == SCREEN_SETTINGS && OledDisplay::instance().settingsDetailOpen()) {
+                    adjustEqSetting(-1);
+                }
+                else if (g_inputMode == MODE_BT) g_a2dp.volume_down();
                 prev_last_repeat_ms = now;
             }
         } else if (!prev_btn && prev_held) {
             prev_held = false;
             if (!prev_long_fired && now - prev_press_ms >= DEBOUNCE_MS) {
-                if (OledDisplay::instance().screenMode() == SCREEN_WAVE)
+                // prev button short press
+                if (OledDisplay::instance().screenMode() == SCREEN_SETTINGS) {
+                    if (OledDisplay::instance().settingsDetailOpen()) adjustEqSetting(-1);
+                    else OledDisplay::instance().settingsMoveRow(-1);
+                } else if (OledDisplay::instance().screenMode() == SCREEN_WAVE) {
                     OledDisplay::instance().decreaseWaveGain();
-                else
-                    if (g_inputMode == MODE_BT) doPrevTrack();
+                } else {
+                    doPrevTrack();
+                }
             }
             prev_long_fired = false;
         }
@@ -1977,16 +2101,25 @@ static void toggleLineInMute() {
         } else if (next_btn && next_held) {
             if (now - next_press_ms >= HOLD_THRESHOLD_MS && now - next_last_repeat_ms >= REPEAT_INTERVAL_MS) {
                 next_long_fired = true;
-                if (g_inputMode == MODE_BT) g_a2dp.volume_up();
+                // next button held and repeating
+                if (OledDisplay::instance().screenMode() == SCREEN_SETTINGS && OledDisplay::instance().settingsDetailOpen()) {
+                    adjustEqSetting(+1);
+                } else if (g_inputMode == MODE_BT) g_a2dp.volume_up();
                 next_last_repeat_ms = now;
             }
         } else if (!next_btn && next_held) {
             next_held = false;
             if (!next_long_fired && now - next_press_ms >= DEBOUNCE_MS) {
-                if (OledDisplay::instance().screenMode() == SCREEN_WAVE)
+                // next button short press
+                if (OledDisplay::instance().screenMode() == SCREEN_SETTINGS) {
+                    if (OledDisplay::instance().settingsDetailOpen()) adjustEqSetting(+1);
+                    else OledDisplay::instance().settingsMoveRow(+1);
+                } else if (OledDisplay::instance().screenMode() == SCREEN_WAVE) {
                     OledDisplay::instance().increaseWaveGain();
-                else
-                    if (g_inputMode == MODE_BT) doNextTrack();
+                } else {
+                    doNextTrack();
+                }
+
             }
             next_long_fired = false;
         }
@@ -2076,10 +2209,12 @@ static void toggleLineInMute() {
                      int v = (int)roundf((dB + 60.0f) * (100.0f / 60.0f));
                      return (v < 0) ? 0 : ((v > 100) ? 100 : v);
                  };
- 
+                 
+                 #ifdef CONFIG_BT_BLE_ENABLED
                  if (g_ble.isConnected() && !g_pauseBleNotifications) {
                      g_ble.updateLevels(dbToPos(smooth30_dB), dbToPos(smooth60_dB), dbToPos(smooth100_dB));
                  }
+                 #endif
              }
          } else {
              gpio_set_level((gpio_num_t)APP_BEAT_LED_GPIO, 0);
@@ -2195,14 +2330,14 @@ static void toggleLineInMute() {
  
      // Load settings
      g_settings.load();
-     bool bassBoost, channelFlip, bypass;
-     int8_t eqBass, eqMid, eqTreble;
+    //  bool bassBoost, channelFlip, bypass;
     //  std::string deviceName;
      bool soundMuted;
-     g_settings.getControl(bassBoost, channelFlip, bypass);
-     g_settings.getEQ(eqBass, eqMid, eqTreble);
+     g_settings.getControl(g_bassBoost, g_channelFlip, g_bypass);
+     g_settings.getEQ(g_eqBass, g_eqMid, g_eqTreble);
      g_settings.getDeviceName(deviceName);
      soundMuted = g_settings.loadSoundMuted();
+     g_eqPresetId = g_settings.loadEqPreset();
  
      // Initialize sound player (sets muted state and scans SPIFFS for existing sounds)
      g_sound.init(APP_I2S_DEFAULT_SAMPLE_RATE);
@@ -2212,10 +2347,13 @@ static void toggleLineInMute() {
  
      // Initialize DSP
      g_dsp.setSampleRate(APP_I2S_DEFAULT_SAMPLE_RATE);
-     g_dsp.setEQ(eqBass, eqMid, eqTreble, APP_I2S_DEFAULT_SAMPLE_RATE);
-     g_dsp.setBassBoost(bassBoost);
-     g_dsp.setChannelFlip(channelFlip);
-     g_dsp.setBypass(bypass);
+     g_dsp.setEQ(g_eqBass, g_eqMid, g_eqTreble, APP_I2S_DEFAULT_SAMPLE_RATE);
+     g_dsp.setBassBoost(g_bassBoost);
+     g_dsp.setChannelFlip(g_channelFlip);
+     g_dsp.setBypass(g_bypass);
+     OledDisplay::instance().setEqValues(g_eqBass, g_eqMid, g_eqTreble);
+     OledDisplay::instance().setEqPreset(g_eqPresetId);
+     OledDisplay::instance().setToggleStates(g_dsp.isBassBoostEnabled(), g_dsp.isChannelFlipEnabled(), g_dsp.isBypassEnabled());
  
      logHeap("after_dsp");
  
@@ -2344,7 +2482,7 @@ static void toggleLineInMute() {
         gpio_set_level((gpio_num_t)APP_LINE_IN_RELAY_GPIO, 1);
         OledDisplay::instance().setInputMode(MODE_LINE);
         OledDisplay::instance().setBottomText("Line Input Mode");
-        // skip g_a2dp.start() entirely this boot — device comes up already in Line mode
+        LineInputCapture::init();
         ESP_LOGI(TAG, "Started up as Line Input Mode");
      } else {
         g_inputMode = MODE_BT;
@@ -2365,7 +2503,7 @@ static void toggleLineInMute() {
             if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
                 ESP_LOGE(TAG, "BT controller init failed: %s", esp_err_to_name(err));
             }
-            err = esp_bt_controller_enable(ESP_BT_MODE_BTDM);
+            err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
             if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
                 ESP_LOGE(TAG, "BT controller enable failed: %s", esp_err_to_name(err));
             }
@@ -2383,6 +2521,7 @@ static void toggleLineInMute() {
         }
 
         // Initialize BLE
+        #ifdef CONFIG_BLE_ENABLED
         #ifdef CONFIG_LED_MATRIX_ENABLE
         // Unified BLE callbacks: EQ, EqPreset, Control, Name, LED, LedEffect, LedBright, SoundMute, SoundDelete, SoundData, OTA
         g_ble.setCallbacks(
@@ -2400,7 +2539,7 @@ static void toggleLineInMute() {
         );
         uint8_t savedLedEffect = g_settings.loadLedEffect();
         uint8_t savedBrightness = LedController::getInstance().getBrightness();
-        g_ble.init(deviceName.c_str(), APP_FW_VERSION, getControlByte(), eqBass, eqMid, eqTreble, savedLedEffect, savedBrightness);
+        g_ble.init(deviceName.c_str(), APP_FW_VERSION, getControlByte(), g_eqBass, g_eqMid, g_eqTreble, savedLedEffect, savedBrightness);
         #else
         // Unified BLE callbacks without LED matrix
         g_ble.setCallbacks(
@@ -2416,7 +2555,7 @@ static void toggleLineInMute() {
             onBleSoundUpload,   // SoundDataCallback
             onBleOtaUnified     // OtaCallback
         );
-        g_ble.init(deviceName.c_str(), APP_FW_VERSION, getControlByte(), eqBass, eqMid, eqTreble);
+        g_ble.init(deviceName.c_str(), APP_FW_VERSION, getControlByte(), g_eqBass, g_eqMid, g_eqTreble);
         #endif
         
         // Initialize BLE sound status with current sound player status
@@ -2432,7 +2571,7 @@ static void toggleLineInMute() {
                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                     (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         });
-
+        #endif  // CONFIG_BLE_ENABLED
         // ========================================================================
         // A2DP Initialization
         // ========================================================================
@@ -2441,7 +2580,7 @@ static void toggleLineInMute() {
         // ESP-IDF Bluetooth stack has a bug where simultaneous AVRCP connection attempts
         // can crash in bta_av_rc_create - waiting allows the phone's connection attempt
         // to start first and avoids the race condition
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        // vTaskDelay(pdMS_TO_TICKS(500));
 
         // Start A2DP
         g_a2dp.set_output_active(false);
@@ -2451,6 +2590,17 @@ static void toggleLineInMute() {
         g_a2dp.set_task_core(1);
         g_a2dp.set_on_connection_state_changed(onConnectionState);
         g_a2dp.set_on_audio_state_changed(onAudioState);
+        g_a2dp.set_on_duration_changed([](uint32_t ms) { OledDisplay::instance().setDuration(ms); });
+        g_a2dp.set_on_position_changed([](uint32_t ms) { OledDisplay::instance().setPosition(ms); });
+        g_a2dp.set_on_track_metadata_changed([](const char* title, const char* artist, const char* album) {
+            OledDisplay::instance().setTrackInfo(title, artist, album);
+        });
+        g_a2dp.set_on_play_status_changed([](esp_avrc_playback_stat_t status) {
+            OledDisplay::instance().setPlaying(status == ESP_AVRC_PLAYBACK_PLAYING);
+        });
+        g_a2dp.set_on_peer_name_resolved([](const char* name) {
+            OledDisplay::instance().setPeerName(name);
+        });
         
         // Volume change callback - sync with LED and encoder controller
         g_a2dp.set_avrc_rn_volumechange([](int volume) {
@@ -2499,8 +2649,9 @@ static void toggleLineInMute() {
                 }
             }
         });
-        g_a2dp.start(deviceName.c_str());
+        g_a2dp.start(deviceName.c_str(), true);
         logHeap("after_a2dp");
+        // g_a2dp.set_volume(64); // Default volume to 50% (0-127)
 
         // Wait for A2DP stack to fully initialize before changing discoverability
         // The library sets connectable=true during init, we need to override after
@@ -2514,7 +2665,6 @@ static void toggleLineInMute() {
         ESP_LOGI(TAG, "A2DP started as '%s' - discoverable/connectable", deviceName.c_str());
         logHeap("after_bt_ready");
         OledDisplay::instance().setBottomText("Waiting for connection . . .");
-        // existing g_a2dp.start() boot path runs as normal
         ESP_LOGI(TAG, "Started up as Bluetooth Mode");
      }
 
